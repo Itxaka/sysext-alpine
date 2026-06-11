@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+
+description="Merge configuration extension images into /etc"
+
+command="/usr/bin/confext"
+
+depend() {
+	need localmount
+	after modules
+}
+
+start() {
+	ebegin "Merging configuration extensions"
+	$command merge
+	eend $?
+}
+
+stop() {
+	ebegin "Unmerging configuration extensions"
+	$command unmerge
+	eend $?
+}
+
+status() {
+	$command status
+}

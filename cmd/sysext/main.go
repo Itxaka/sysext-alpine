@@ -23,5 +23,5 @@ func main() {
 // --json=short|pretty|off, --no-reload, --always-refresh=yes|no, --confext,
 // -h/--help, --version. Default verb: status.
 func run(args []string) error {
-	panic("unimplemented")
+	return runWith(args, os.Stdout, os.Stderr)
 }

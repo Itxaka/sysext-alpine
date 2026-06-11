@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+
+description="Merge system extension images into /usr and /opt"
+
+command="/usr/bin/sysext"
+
+depend() {
+	need localmount
+	after modules
+}
+
+start() {
+	ebegin "Merging system extensions"
+	$command merge
+	eend $?
+}
+
+stop() {
+	ebegin "Unmerging system extensions"
+	$command unmerge
+	eend $?
+}
+
+status() {
+	$command status
+}

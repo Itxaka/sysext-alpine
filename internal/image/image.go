@@ -8,6 +8,14 @@
 package image
 
 import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"golang.org/x/sys/unix"
+
 	"github.com/itxaka/sysext-alpine/internal/discover"
 )
 
@@ -33,6 +41,10 @@ type Mounted struct {
 	Partition string
 	// FS is the detected payload filesystem.
 	FS FSType
+
+	// mountTarget is the directory we actually mounted on (Root, or
+	// Root/usr for usr-only GPT images). Empty for directory images.
+	mountTarget string
 }
 
 // Detect probes the file at path and returns the format: checks GPT header
@@ -40,7 +52,7 @@ type Mounted struct {
 // ("hsqs" at 0), erofs magic (0xE0F5E1E2 LE at 1024), ext4 magic
 // (0xEF53 LE at 1080).
 func Detect(path string) (FSType, error) {
-	panic("unimplemented")
+	return detectPath(path)
 }
 
 // Mount makes the image's tree available at mountPoint (which must exist)
@@ -54,17 +66,198 @@ func Detect(path string) (FSType, error) {
 //
 // On any error all intermediate resources are released.
 func Mount(img discover.Image, mountPoint, arch string) (*Mounted, error) {
-	panic("unimplemented")
+	if img.Type == discover.TypeDirectory {
+		return &Mounted{Root: img.Path}, nil
+	}
+
+	fs, err := Detect(img.Path)
+	if err != nil {
+		return nil, fmt.Errorf("detecting format of %s: %w", img.Path, err)
+	}
+
+	switch fs {
+	case FSSquashfs, FSErofs, FSExt4:
+		return mountBareFS(img.Path, mountPoint, fs)
+	case FSGPT:
+		return mountGPT(img.Path, mountPoint, arch)
+	default:
+		return nil, fmt.Errorf("%s: unrecognized image format", img.Path)
+	}
+}
+
+// mountBareFS loop-attaches a partition-table-less raw image and mounts it.
+func mountBareFS(path, mountPoint string, fs FSType) (*Mounted, error) {
+	loopDev, err := loopAttach(path, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := mountRO(loopDev, mountPoint, fs); err != nil {
+		_ = loopDetach(loopDev)
+		return nil, err
+	}
+	return &Mounted{
+		Root:        mountPoint,
+		LoopDevice:  loopDev,
+		FS:          fs,
+		mountTarget: mountPoint,
+	}, nil
+}
+
+// mountGPT parses the partition table, attaches the image with partition
+// scanning, and mounts the selected payload partition.
+func mountGPT(path, mountPoint, arch string) (*Mounted, error) {
+	parts, err := parseGPTFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("parsing GPT of %s: %w", path, err)
+	}
+	part, isUsr, err := selectPartition(parts, arch)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+
+	loopDev, err := loopAttach(path, true)
+	if err != nil {
+		return nil, err
+	}
+
+	cleanup := func() { _ = loopDetach(loopDev) }
+
+	partDev, err := ensurePartitionNode(loopDev, part.Index)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+
+	fs, err := Detect(partDev)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("detecting filesystem on %s: %w", partDev, err)
+	}
+	if fs == FSUnknown || fs == FSGPT {
+		cleanup()
+		return nil, fmt.Errorf("%s: partition %d has unsupported filesystem", path, part.Index)
+	}
+
+	target := mountPoint
+	if isUsr {
+		// Only a usr partition: synthesize the tree root so the payload
+		// shows up under <mountPoint>/usr.
+		target = filepath.Join(mountPoint, "usr")
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
+
+	if err := mountRO(partDev, target, fs); err != nil {
+		cleanup()
+		return nil, err
+	}
+	return &Mounted{
+		Root:        mountPoint,
+		LoopDevice:  loopDev,
+		Partition:   partDev,
+		FS:          fs,
+		mountTarget: target,
+	}, nil
+}
+
+// mountRO mounts a read-only nodev filesystem.
+func mountRO(device, target string, fs FSType) error {
+	err := unix.Mount(device, target, string(fs), unix.MS_RDONLY|unix.MS_NODEV, "")
+	if err != nil {
+		return fmt.Errorf("mounting %s (%s) at %s: %w", device, fs, target, err)
+	}
+	return nil
 }
 
 // Unmount releases the mount and detaches the loop device. Safe to call on
 // directory-backed images (no-op).
 func (m *Mounted) Unmount() error {
-	panic("unimplemented")
+	if m == nil || (m.LoopDevice == "" && m.mountTarget == "") {
+		return nil // directory image
+	}
+
+	targets := []string{m.mountTarget}
+	if m.mountTarget == "" {
+		// Handle reconstructed from lost state: try both possible targets.
+		targets = []string{filepath.Join(m.Root, "usr"), m.Root}
+	}
+
+	var firstErr error
+	for _, t := range targets {
+		if t == "" {
+			continue
+		}
+		if err := unmountTolerant(t); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if m.LoopDevice != "" {
+		if err := loopDetach(m.LoopDevice); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// unmountTolerant unmounts target, ignoring "not mounted"/missing errors and
+// falling back to a lazy detach when the mount is busy.
+func unmountTolerant(target string) error {
+	err := unix.Unmount(target, 0)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, unix.EINVAL), errors.Is(err, unix.ENOENT):
+		// Not a mount point / already gone.
+		return nil
+	case errors.Is(err, unix.EBUSY):
+		if err := unix.Unmount(target, unix.MNT_DETACH); err != nil &&
+			!errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("lazy unmount %s: %w", target, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unmount %s: %w", target, err)
+	}
 }
 
 // DetachAllLoopsFor detaches any loop devices whose backing file is path.
 // Used by unmerge cleanup when state was lost.
 func DetachAllLoopsFor(path string) error {
-	panic("unimplemented")
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		resolved = abs
+	}
+
+	backings, err := filepath.Glob("/sys/block/loop*/loop/backing_file")
+	if err != nil {
+		return err
+	}
+
+	var firstErr error
+	for _, bf := range backings {
+		data, err := os.ReadFile(bf)
+		if err != nil {
+			continue // device went away
+		}
+		backing := strings.TrimSpace(string(data))
+		// The kernel appends " (deleted)" when the backing file was
+		// unlinked while attached.
+		backing = strings.TrimSuffix(backing, " (deleted)")
+		if backing != abs && backing != resolved {
+			continue
+		}
+		// /sys/block/loopN/loop/backing_file -> /dev/loopN
+		devName := filepath.Base(filepath.Dir(filepath.Dir(bf)))
+		if err := loopDetach("/dev/" + devName); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }

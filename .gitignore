@@ -1,0 +1,10 @@
+# Build output
+bin/
+
+# Test extension images
+*.raw
+
+# Go test artifacts
+*.test
+*.out
+coverage.html
