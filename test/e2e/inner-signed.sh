@@ -374,6 +374,12 @@ else
     FIXTURE_CRT=$(ls /work/test/fixtures/*.crt \
         /work/test/fixtures/*.pem 2>/dev/null | head -n1)
 fi
+# No local fixture: fall back to the committed signed example (a genuine
+# systemd-repart artifact with public test keys, see examples/README.md).
+if [ -z "${FIXTURE_IMG:-}" ] && [ -f /work/examples/signed-example.raw ]; then
+    FIXTURE_IMG=/work/examples/signed-example.raw
+    FIXTURE_CRT=/work/examples/keys/db.pem
+fi
 if [ -n "${FIXTURE_IMG:-}" ] && [ -n "${FIXTURE_CRT:-}" ]; then
     echo "=== Real signed fixture: $FIXTURE_IMG (cert: $FIXTURE_CRT) ==="
     rm -f /etc/verity.d/*.crt /var/lib/extensions/*.raw
@@ -386,6 +392,14 @@ if [ -n "${FIXTURE_IMG:-}" ] && [ -n "${FIXTURE_CRT:-}" ]; then
         # Valid certificate: signed-only policy must succeed.
         if out=$(sysext --image-policy=root=signed --force merge 2>&1); then
             pass "real signed fixture merged with root=signed"
+            # The committed example carries a known payload — verify it.
+            if [ "$FIXTURE_IMG" = /work/examples/signed-example.raw ]; then
+                if [ "$(cat /usr/share/signed-example/hello.txt 2>/dev/null)" = "hello from signed-example" ]; then
+                    pass "example payload readable through signed merge"
+                else
+                    fail "example payload missing/incorrect after signed merge"
+                fi
+            fi
             sysext unmerge || fail "unmerge after fixture merge"
         else
             fail "real signed fixture rejected: $out"

@@ -1,8 +1,10 @@
-# Build output
-bin/
+# Build output (root-level only — examples/ contains a usr/bin payload)
+/bin/
 
 # Test extension images
 *.raw
+# ... except the committed signed example (public test keys, see examples/)
+!examples/signed-example.raw
 
 # Go test artifacts
 *.test
