@@ -22,14 +22,25 @@ if [ -z "$SUITES" ]; then
     SUITES=$(cd "$REPO/test/e2e" && ls inner*.sh)
 fi
 
+# Coverage mode: when COVDIR is set (see `make e2e-cover`), mount it into the
+# container and point the instrumented binary's GOCOVERDIR at it, so every
+# sysext/confext invocation in the suites emits binary coverage data.
+COVARGS=""
+if [ -n "${COVDIR:-}" ]; then
+    mkdir -p "$COVDIR"
+    COVARGS="-v $COVDIR:/covdata -e GOCOVERDIR=/covdata"
+fi
+
 # Host kernel modules are mounted read-only so the (privileged) container can
 # modprobe squashfs/erofs/etc. for the host kernel.
 rc=0
 for suite in $SUITES; do
     echo "=== e2e suite: $suite ==="
+    # shellcheck disable=SC2086  # COVARGS is intentionally word-split
     "$DOCKER" run --privileged --rm \
         -v "$REPO:/work" \
         -v /lib/modules:/lib/modules:ro \
+        $COVARGS \
         "$IMAGE" \
         /bin/sh "/work/test/e2e/$suite" || rc=1
 done

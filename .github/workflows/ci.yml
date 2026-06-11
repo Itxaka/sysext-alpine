@@ -18,8 +18,19 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: go vet
         run: go vet ./...
-      - name: go test
-        run: go test ./...
+      - name: go test (with coverage)
+        run: |
+          go test -coverprofile=coverage.out -covermode=atomic ./...
+          {
+            echo '## Unit coverage'
+            echo '```'
+            go tool cover -func=coverage.out | tail -n 1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage.out
 
   build:
     runs-on: ubuntu-latest
@@ -56,9 +67,21 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Build static binary
-        run: make build-static
       # Privileged Alpine container with /lib/modules mounted; suites that
       # need a kernel module unavailable on the runner (e.g. erofs) SKIP.
-      - name: Run e2e suites
-        run: ./test/e2e/run.sh
+      # Runs with a coverage-instrumented binary (make e2e-cover) so the
+      # mount/loop/dm paths unit tests cannot reach are measured too.
+      - name: Run e2e suites (instrumented)
+        run: make e2e-cover
+      - name: e2e coverage summary
+        run: |
+          {
+            echo '## e2e coverage'
+            echo '```'
+            go tool cover -func=coverage-e2e.out | tail -n 1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-e2e
+          path: coverage-e2e.out

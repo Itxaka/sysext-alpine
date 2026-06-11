@@ -15,3 +15,8 @@ coverage.html
 # never commit; see test/fixtures/README.md)
 test/fixtures/*
 !test/fixtures/README.md
+
+# Coverage artifacts
+coverage*.out
+coverage.html
+.covdata/
