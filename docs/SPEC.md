@@ -47,11 +47,15 @@ Match algorithm against host `/etc/os-release` (fallback `/usr/lib/os-release`):
    identifiers: `x86-64`, `arm64`, `riscv64`, `x86`, `arm`, ...).
 4. `--force` skips all checks.
 5. `EXTENSION_RELOAD_MANAGER=1` → systemd reloads the service manager; on
-   Alpine: no-op (log only).
+   Alpine: `rc-update -u` refreshes the OpenRC dependency cache after merge
+   (skipped with `--no-reload`, with `--force`, on unmerge, or when not an
+   OpenRC system).
 
-Extra fields `SYSEXT_SCOPE=`/`CONFEXT_SCOPE=` (`initrd`, `system`, `portable`):
-informational; systemd-sysext checks scope contains `system` when running on a
-booted system. Default when absent: applies everywhere.
+Extra fields `SYSEXT_SCOPE=`/`CONFEXT_SCOPE=` (whitespace-separated list of
+`initrd`, `system`, `portable`): enforced. We always run on a booted system,
+so if the class's scope field is present and non-empty its list must contain
+`system`, otherwise the image is rejected with a descriptive error. Absent or
+empty field: no restriction (applies everywhere).
 
 ## 3. Image formats
 
@@ -65,8 +69,9 @@ booted system. Default when absent: applies everywhere.
    - usr  x86-64: `8484680c-9521-48c6-9c11-b0720656f69e`
    - usr  arm64:  `b0e01050-ee5f-4390-949a-9101b17104e9`
    Use root partition if present, else usr partition (mounted at `/usr` of the
-   image tree). Verity/signature partitions: **out of MVP scope** (ignore).
-4. Image policy / verity / signatures: out of scope for MVP.
+   image tree). Verity and verity-signature partitions are honored: see
+   docs/VERITY.md (dm-verity activation, PKCS#7 signature verification
+   against /etc/verity.d, systemd.image-policy(7) enforcement).
 
 Filesystem magics: squashfs `hsqs` @ 0; erofs `0xE0F5E1E2` @ 1024; ext4
 `0xEF53` @ 1080; GPT: `EFI PART` @ LBA1 (offset 512, also check 4096 sector).
@@ -132,8 +137,8 @@ A hierarchy is "merged by us" iff:
 - confext overlay: `MS_RDONLY|MS_NODEV|MS_NOSUID|MS_NOEXEC`
 - Image loop mounts: read-only.
 - Overlay fs options for immutable mode: just `lowerdir=...` (no upperdir/workdir).
-  (Mutable mode would add `redirect_dir=on,noatime,metacopy=off,index=off` +
-  upperdir/workdir — out of MVP scope.)
+  Mutable modes add upperdir/workdir + `redirect_dir=on,metacopy=off,index=off`
+  data options and the MS_NOATIME flag: see docs/MUTABLE.md.
 
 ## 5. Commands
 
@@ -164,10 +169,19 @@ A hierarchy is "merged by us" iff:
 - Marker paths intentionally keep the `systemd` name for interop with images
   and tooling that probe `/run/systemd/sysext` & `.systemd-sysext`.
 
-## 7. Out of MVP scope (tracked, not implemented)
+## 7. Implemented beyond the MVP
 
-- Verity / signatures / image policies
-- Mutable modes (`--mutable=`)
-- initrd integration, `/.extra/sysext`
-- `EXTENSION_RELOAD_MANAGER` action
+- Verity / signatures / image policies (docs/VERITY.md)
+- Mutable modes (docs/MUTABLE.md)
+- sysext.conf(5)/confext.conf config files + drop-ins (Mutable=, ImagePolicy=)
+- SYSTEMD_SYSEXT_HIERARCHIES / SYSTEMD_CONFEXT_HIERARCHIES overrides
+- Merge/unmerge serialization via flock on /run/systemd/<class>.lock
+- SYSEXT_SCOPE/CONFEXT_SCOPE enforcement
+- `EXTENSION_RELOAD_MANAGER` → OpenRC dependency-cache refresh
+
+## 8. Out of scope (deliberate)
+
+- initrd integration, `/.extra/sysext` (no systemd-stub flow on Alpine)
+- LUKS (`encrypted` image-policy term never matches)
+- service-manager reload semantics beyond the OpenRC cache refresh
 - btrfs subvolume special-casing (plain dir handling covers it)

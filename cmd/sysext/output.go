@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -72,6 +73,44 @@ func formatTimestamp(unix int64) string {
 	return time.Unix(unix, 0).Local().Format("Mon 2006-01-02 15:04:05 MST")
 }
 
+// sortStatuses orders hierarchy statuses alphabetically by hierarchy, the
+// order systemd presents them in (e.g. /opt before /usr).
+func sortStatuses(statuses []overlay.Status) {
+	slices.SortFunc(statuses, func(a, b overlay.Status) int {
+		return strings.Compare(a.Hierarchy, b.Hierarchy)
+	})
+}
+
+// statusJSON is the JSON shape of one `status` element, byte-compatible
+// with systemd-sysext's --json output: extensions is either the literal
+// string "none" or an array of extension names, since is null or the marker
+// mtime in microseconds. There is no "merged" key.
+type statusJSON struct {
+	Hierarchy  string `json:"hierarchy"`
+	Extensions any    `json:"extensions"` // "none" or []string
+	Since      *int64 `json:"since"`      // usec; null when unmerged
+}
+
+// toStatusJSON converts hierarchy statuses to the systemd JSON shape.
+// Always returns a non-nil slice so JSON output is [] rather than null.
+func toStatusJSON(statuses []overlay.Status) []statusJSON {
+	out := make([]statusJSON, 0, len(statuses))
+	for _, s := range statuses {
+		e := statusJSON{Hierarchy: s.Hierarchy, Extensions: "none"}
+		if s.Merged {
+			if len(s.Extensions) > 0 {
+				e.Extensions = s.Extensions
+			}
+			if s.Since != 0 {
+				usec := s.Since * 1_000_000 // unix seconds → usec
+				e.Since = &usec
+			}
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
 // statusRows converts hierarchy statuses to table rows
 // (HIERARCHY / EXTENSIONS / SINCE).
 func statusRows(statuses []overlay.Status) [][]string {
@@ -91,12 +130,13 @@ func statusRows(statuses []overlay.Status) [][]string {
 	return rows
 }
 
-// listEntry is the JSON shape of one `list` line.
+// listEntry is the JSON shape of one `list` line, matching systemd's
+// lowercased table-column keys: name, type, path, time (usec).
 type listEntry struct {
-	Name  string `json:"name"`
-	Type  string `json:"type"`
-	Path  string `json:"path"`
-	MTime int64  `json:"mtime"` // unix seconds
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Path string `json:"path"`
+	Time int64  `json:"time"` // unix microseconds
 }
 
 // imageTypeString maps discover.ImageType to display text. Implemented
@@ -118,10 +158,10 @@ func toListEntries(images []discover.Image) []listEntry {
 	entries := make([]listEntry, 0, len(images))
 	for _, img := range images {
 		entries = append(entries, listEntry{
-			Name:  img.Name,
-			Type:  imageTypeString(img.Type),
-			Path:  img.Path,
-			MTime: img.ModTime,
+			Name: img.Name,
+			Type: imageTypeString(img.Type),
+			Path: img.Path,
+			Time: img.ModTime * 1_000_000, // unix seconds → usec
 		})
 	}
 	return entries
@@ -132,8 +172,8 @@ func listRows(entries []listEntry) [][]string {
 	rows := make([][]string, 0, len(entries))
 	for _, e := range entries {
 		t := "-"
-		if e.MTime != 0 {
-			t = formatTimestamp(e.MTime)
+		if e.Time != 0 {
+			t = formatTimestamp(e.Time / 1_000_000) // usec → unix seconds
 		}
 		rows = append(rows, []string{e.Name, e.Type, e.Path, t})
 	}

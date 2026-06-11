@@ -3,18 +3,32 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	extconf "github.com/itxaka/sysext-alpine/internal/config"
 	"github.com/itxaka/sysext-alpine/internal/discover"
 	"github.com/itxaka/sysext-alpine/internal/overlay"
 	"github.com/itxaka/sysext-alpine/internal/release"
 )
 
-// NOTE: these tests deliberately exercise only CLI-local code (parsing,
-// formatting, refresh skip decision). The internal/* packages are stubs
-// under parallel development and their functions panic; nothing here calls
-// into them — only their types/constants are used.
+// NOTE: these tests exercise CLI-local code (parsing, formatting, config
+// application, refresh-skip and reload decisions) plus the read-only verbs
+// against temporary --root trees; nothing here mounts or needs privileges.
+
+// writeFile creates <root>/<rel> with content, making parent dirs.
+func writeFile(t *testing.T, root, rel, content string) {
+	t.Helper()
+	path := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestClassFromArgv0(t *testing.T) {
 	cases := []struct {
@@ -369,35 +383,55 @@ func TestStatusRows(t *testing.T) {
 	}
 }
 
-func TestStatusJSONShape(t *testing.T) {
-	statuses := []overlay.Status{
-		{Hierarchy: "/usr", Merged: true, Extensions: []string{"foo"}, Since: 1700000000},
+// TestStatusJSONGolden pins the systemd-compatible status JSON byte-for-byte
+// (--json=short; systemd 260 field order hierarchy, extensions, since).
+func TestStatusJSONGolden(t *testing.T) {
+	// Unmerged, as captured from systemd 260: extensions is the string
+	// "none", since is null, hierarchies sorted alphabetically.
+	unmerged := []overlay.Status{
+		{Hierarchy: "/usr", Merged: false},
 		{Hierarchy: "/opt", Merged: false},
 	}
-	short, err := renderJSON(statuses, jsonShort)
+	sortStatuses(unmerged)
+	got, err := renderJSON(toStatusJSON(unmerged), jsonShort)
 	if err != nil {
-		t.Fatalf("renderJSON short: %v", err)
+		t.Fatalf("renderJSON: %v", err)
 	}
-	if strings.Count(strings.TrimSpace(short), "\n") != 0 {
-		t.Errorf("short JSON should be a single line: %q", short)
-	}
-	var decoded []map[string]any
-	if err := json.Unmarshal([]byte(short), &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(decoded) != 2 {
-		t.Fatalf("want 2 elements, got %d", len(decoded))
-	}
-	for _, key := range []string{"hierarchy", "merged", "extensions", "since"} {
-		if _, ok := decoded[0][key]; !ok {
-			t.Errorf("JSON element missing key %q: %v", key, decoded[0])
-		}
-	}
-	if decoded[0]["hierarchy"] != "/usr" || decoded[0]["merged"] != true {
-		t.Errorf("unexpected values: %v", decoded[0])
+	want := `[{"hierarchy":"/opt","extensions":"none","since":null},` +
+		`{"hierarchy":"/usr","extensions":"none","since":null}]` + "\n"
+	if got != want {
+		t.Errorf("unmerged JSON:\n got %q\nwant %q", got, want)
 	}
 
-	pretty, err := renderJSON(statuses, jsonPretty)
+	// Merged: extensions is an array of names, since is a usec timestamp.
+	merged := []overlay.Status{
+		{Hierarchy: "/usr", Merged: true, Extensions: []string{"foo", "bar"}, Since: 1700000000},
+		{Hierarchy: "/opt", Merged: false},
+	}
+	sortStatuses(merged)
+	got, err = renderJSON(toStatusJSON(merged), jsonShort)
+	if err != nil {
+		t.Fatalf("renderJSON: %v", err)
+	}
+	want = `[{"hierarchy":"/opt","extensions":"none","since":null},` +
+		`{"hierarchy":"/usr","extensions":["foo","bar"],"since":1700000000000000}]` + "\n"
+	if got != want {
+		t.Errorf("merged JSON:\n got %q\nwant %q", got, want)
+	}
+
+	// No "merged" key in any element.
+	var decoded []map[string]any
+	if err := json.Unmarshal([]byte(got), &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, el := range decoded {
+		if _, ok := el["merged"]; ok {
+			t.Errorf("JSON element must not have a 'merged' key: %v", el)
+		}
+	}
+
+	// Pretty mode stays valid JSON with the same data.
+	pretty, err := renderJSON(toStatusJSON(merged), jsonPretty)
 	if err != nil {
 		t.Fatalf("renderJSON pretty: %v", err)
 	}
@@ -410,30 +444,48 @@ func TestStatusJSONShape(t *testing.T) {
 	}
 }
 
-func TestListEntriesJSONShape(t *testing.T) {
+// Merged hierarchy with an empty recorded extension list still renders the
+// string "none", and a zero Since renders null.
+func TestStatusJSONMergedEmpty(t *testing.T) {
+	statuses := []overlay.Status{{Hierarchy: "/etc", Merged: true}}
+	got, err := renderJSON(toStatusJSON(statuses), jsonShort)
+	if err != nil {
+		t.Fatalf("renderJSON: %v", err)
+	}
+	want := `[{"hierarchy":"/etc","extensions":"none","since":null}]` + "\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestSortStatuses(t *testing.T) {
+	statuses := []overlay.Status{
+		{Hierarchy: "/usr"}, {Hierarchy: "/opt"}, {Hierarchy: "/etc"},
+	}
+	sortStatuses(statuses)
+	want := []string{"/etc", "/opt", "/usr"}
+	for i, s := range statuses {
+		if s.Hierarchy != want[i] {
+			t.Fatalf("sortStatuses order = %v, want %v", statuses, want)
+		}
+	}
+}
+
+// TestListJSONGolden pins the systemd-compatible list JSON byte-for-byte:
+// lowercased table-column keys name/type/path/time, time in usec.
+func TestListJSONGolden(t *testing.T) {
 	images := []discover.Image{
 		{Name: "foo", Path: "/var/lib/extensions/foo.raw", Type: discover.TypeRaw, ModTime: 1700000000},
 		{Name: "bar", Path: "/etc/extensions/bar", Type: discover.TypeDirectory, ModTime: 1700000001},
 	}
-	entries := toListEntries(images)
-	out, err := renderJSON(entries, jsonShort)
+	out, err := renderJSON(toListEntries(images), jsonShort)
 	if err != nil {
 		t.Fatalf("renderJSON: %v", err)
 	}
-	var decoded []map[string]any
-	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(decoded) != 2 {
-		t.Fatalf("want 2 elements, got %d", len(decoded))
-	}
-	for _, key := range []string{"name", "type", "path", "mtime"} {
-		if _, ok := decoded[0][key]; !ok {
-			t.Errorf("missing key %q in %v", key, decoded[0])
-		}
-	}
-	if decoded[0]["type"] != "raw" || decoded[1]["type"] != "directory" {
-		t.Errorf("types wrong: %v / %v", decoded[0]["type"], decoded[1]["type"])
+	want := `[{"name":"foo","type":"raw","path":"/var/lib/extensions/foo.raw","time":1700000000000000},` +
+		`{"name":"bar","type":"directory","path":"/etc/extensions/bar","time":1700000001000000}]` + "\n"
+	if out != want {
+		t.Errorf("list JSON:\n got %q\nwant %q", out, want)
 	}
 
 	// Empty list must encode as [], not null.
@@ -516,5 +568,143 @@ func TestFormatTimestamp(t *testing.T) {
 	got := formatTimestamp(1700000000) // 2023-11-14/15 depending on zone
 	if !strings.Contains(got, "2023") {
 		t.Errorf("formatTimestamp = %q, want year 2023", got)
+	}
+}
+
+// parseArgs must record whether --mutable/--image-policy were given
+// explicitly, so file configuration only applies when they were not.
+func TestParseArgsExplicitTracking(t *testing.T) {
+	cfg, err := parseArgs([]string{"sysext"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.mutableSet || cfg.imagePolicySet {
+		t.Error("mutableSet/imagePolicySet must default to false")
+	}
+	if cfg.mutable != "" || cfg.imagePolicy != "" {
+		t.Errorf("unset options should be empty before config is applied, got mutable=%q imagePolicy=%q",
+			cfg.mutable, cfg.imagePolicy)
+	}
+
+	cfg, err = parseArgs([]string{"sysext", "--mutable=auto", "--image-policy=root=verity"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.mutableSet || cfg.mutable != "auto" {
+		t.Errorf("mutable = %q (set=%v), want auto (set)", cfg.mutable, cfg.mutableSet)
+	}
+	if !cfg.imagePolicySet || cfg.imagePolicy != "root=verity" {
+		t.Errorf("imagePolicy = %q (set=%v), want root=verity (set)", cfg.imagePolicy, cfg.imagePolicySet)
+	}
+}
+
+// applyFileConfig: defaults flow config -> overridden by explicit CLI flags.
+func TestApplyFileConfig(t *testing.T) {
+	cases := []struct {
+		name            string
+		cfg             config
+		file            extconf.Config
+		wantMutable     string
+		wantImagePolicy string
+		wantErr         bool
+	}{
+		{"all unset -> builtin defaults",
+			config{}, extconf.Config{}, "no", "", false},
+		{"config supplies both",
+			config{}, extconf.Config{Mutable: "auto", ImagePolicy: "root=verity"},
+			"auto", "root=verity", false},
+		{"explicit flags beat config",
+			config{mutable: "yes", mutableSet: true, imagePolicy: "cli", imagePolicySet: true},
+			extconf.Config{Mutable: "auto", ImagePolicy: "conf"},
+			"yes", "cli", false},
+		{"flag beats config per option",
+			config{mutable: "import", mutableSet: true},
+			extconf.Config{Mutable: "auto", ImagePolicy: "conf"},
+			"import", "conf", false},
+		{"config boolean spelling normalized",
+			config{}, extconf.Config{Mutable: "true"}, "yes", "", false},
+		{"config mutable=help rejected",
+			config{}, extconf.Config{Mutable: "help"}, "", "", true},
+		{"config invalid mutable rejected",
+			config{}, extconf.Config{Mutable: "banana"}, "", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			err := applyFileConfig(&cfg, tc.file)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("applyFileConfig: %v", err)
+			}
+			if cfg.mutable != tc.wantMutable {
+				t.Errorf("mutable = %q, want %q", cfg.mutable, tc.wantMutable)
+			}
+			if cfg.imagePolicy != tc.wantImagePolicy {
+				t.Errorf("imagePolicy = %q, want %q", cfg.imagePolicy, tc.wantImagePolicy)
+			}
+		})
+	}
+}
+
+// End-to-end flag-vs-config precedence through runWith: a config file under
+// --root sets Mutable=, an explicit flag must still win. Exercised via
+// `--mutable=help`-free verbs that do not touch mounts: we only check that
+// config loading errors surface (invalid Mutable=) and valid configs do not
+// break the status verb's argument handling.
+func TestRunConfigMutableInvalid(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "etc/systemd/sysext.conf", "[SysExt]\nMutable=banana\n")
+	var out, errBuf bytes.Buffer
+	err := runWith([]string{"sysext", "--root", root, "status"}, &out, &errBuf)
+	if err == nil || !strings.Contains(err.Error(), "Mutable=") {
+		t.Errorf("expected invalid Mutable= config error, got %v", err)
+	}
+
+	// An explicit --mutable flag makes the bad config value irrelevant.
+	out.Reset()
+	if err := runWith([]string{"sysext", "--root", root, "--mutable=no", "status"}, &out, &errBuf); err != nil {
+		t.Errorf("explicit --mutable should override invalid config: %v", err)
+	}
+}
+
+func TestWantsReload(t *testing.T) {
+	cases := []struct {
+		fields release.Fields
+		want   bool
+	}{
+		{release.Fields{"EXTENSION_RELOAD_MANAGER": "1"}, true},
+		{release.Fields{"EXTENSION_RELOAD_MANAGER": " 1 "}, true}, // trimmed
+		{release.Fields{"EXTENSION_RELOAD_MANAGER": "0"}, false},
+		{release.Fields{"EXTENSION_RELOAD_MANAGER": "yes"}, false}, // only "1" counts
+		{release.Fields{"EXTENSION_RELOAD_MANAGER": ""}, false},
+		{release.Fields{}, false},
+		{nil, false},
+	}
+	for _, tc := range cases {
+		if got := wantsReload(tc.fields); got != tc.want {
+			t.Errorf("wantsReload(%v) = %v, want %v", tc.fields, got, tc.want)
+		}
+	}
+}
+
+func TestShouldReloadManager(t *testing.T) {
+	cases := []struct {
+		requested, noReload, want bool
+	}{
+		{true, false, true},   // requested, allowed -> reload
+		{true, true, false},   // --no-reload suppresses
+		{false, false, false}, // nothing requested
+		{false, true, false},
+	}
+	for _, tc := range cases {
+		if got := shouldReloadManager(tc.requested, tc.noReload); got != tc.want {
+			t.Errorf("shouldReloadManager(%v, %v) = %v, want %v",
+				tc.requested, tc.noReload, got, tc.want)
+		}
 	}
 }

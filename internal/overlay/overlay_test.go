@@ -29,6 +29,91 @@ func TestHierarchies(t *testing.T) {
 	}
 }
 
+func TestParseHierarchiesEnv(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    []string
+		wantErr bool
+	}{
+		// valid lists
+		{"/usr", []string{"/usr"}, false},
+		{"/usr:/opt", []string{"/usr", "/opt"}, false},
+		{"/usr:/opt:/srv", []string{"/usr", "/opt", "/srv"}, false},
+		{"/etc:/srv/conf.d", []string{"/etc", "/srv/conf.d"}, false},
+		// empty string → nil, nil (caller keeps defaults)
+		{"", nil, false},
+		// relative entry
+		{"usr", nil, true},
+		{"/usr:opt", nil, true},
+		{"./usr", nil, true},
+		// root is not allowed
+		{"/", nil, true},
+		{"/usr:/", nil, true},
+		// not a cleaned path
+		{"/usr/", nil, true},
+		{"/usr//local", nil, true},
+		{"/usr/../etc", nil, true},
+		// duplicates
+		{"/usr:/usr", nil, true},
+		{"/usr:/opt:/usr", nil, true},
+		// empty entries
+		{":", nil, true},
+		{"/usr:", nil, true},
+		{":/usr", nil, true},
+	}
+	for _, c := range cases {
+		got, err := parseHierarchiesEnv(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("parseHierarchiesEnv(%q) = %v, want error", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseHierarchiesEnv(%q): unexpected error %v", c.in, err)
+			continue
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("parseHierarchiesEnv(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestHierarchiesEnvOverride(t *testing.T) {
+	t.Setenv("SYSTEMD_SYSEXT_HIERARCHIES", "/usr:/opt:/srv")
+	if got := Hierarchies(release.Sysext); !reflect.DeepEqual(got, []string{"/usr", "/opt", "/srv"}) {
+		t.Errorf("overridden sysext hierarchies = %v", got)
+	}
+	// the sysext variable must not leak into confext
+	if got := Hierarchies(release.Confext); !reflect.DeepEqual(got, []string{"/etc"}) {
+		t.Errorf("confext hierarchies with sysext override = %v", got)
+	}
+
+	t.Setenv("SYSTEMD_CONFEXT_HIERARCHIES", "/etc:/srv/conf")
+	if got := Hierarchies(release.Confext); !reflect.DeepEqual(got, []string{"/etc", "/srv/conf"}) {
+		t.Errorf("overridden confext hierarchies = %v", got)
+	}
+
+	// empty value → defaults
+	t.Setenv("SYSTEMD_SYSEXT_HIERARCHIES", "")
+	if got := Hierarchies(release.Sysext); !reflect.DeepEqual(got, []string{"/usr", "/opt"}) {
+		t.Errorf("empty env sysext hierarchies = %v", got)
+	}
+}
+
+func TestHierarchiesEnvInvalidFallsBack(t *testing.T) {
+	for _, bad := range []string{"relative/path", "/", "/usr:/usr", "/usr/", "/usr:"} {
+		t.Setenv("SYSTEMD_SYSEXT_HIERARCHIES", bad)
+		if got := Hierarchies(release.Sysext); !reflect.DeepEqual(got, []string{"/usr", "/opt"}) {
+			t.Errorf("env %q: sysext hierarchies = %v, want defaults", bad, got)
+		}
+		t.Setenv("SYSTEMD_CONFEXT_HIERARCHIES", bad)
+		if got := Hierarchies(release.Confext); !reflect.DeepEqual(got, []string{"/etc"}) {
+			t.Errorf("env %q: confext hierarchies = %v, want defaults", bad, got)
+		}
+	}
+}
+
 func TestWorkspace(t *testing.T) {
 	cases := []struct {
 		class release.Class

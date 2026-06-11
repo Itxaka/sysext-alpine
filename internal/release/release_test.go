@@ -29,6 +29,15 @@ func TestClassLevelField(t *testing.T) {
 	}
 }
 
+func TestClassScopeField(t *testing.T) {
+	if got := Sysext.ScopeField(); got != "SYSEXT_SCOPE" {
+		t.Errorf("Sysext.ScopeField() = %q, want SYSEXT_SCOPE", got)
+	}
+	if got := Confext.ScopeField(); got != "CONFEXT_SCOPE" {
+		t.Errorf("Confext.ScopeField() = %q, want CONFEXT_SCOPE", got)
+	}
+}
+
 func TestParse(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -351,6 +360,88 @@ func TestMatch(t *testing.T) {
 			ext:   Fields{"ID": "alpine", "VERSION_ID": "3.20"},
 			class: Sysext,
 		},
+		{
+			name:  "SYSEXT_SCOPE absent is OK",
+			host:  Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:   Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			class: Sysext,
+		},
+		{
+			name:  "SYSEXT_SCOPE empty is OK",
+			host:  Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:   Fields{"ID": "alpine", "VERSION_ID": "3.20", "SYSEXT_SCOPE": ""},
+			class: Sysext,
+		},
+		{
+			name:  "SYSEXT_SCOPE system is OK",
+			host:  Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:   Fields{"ID": "alpine", "VERSION_ID": "3.20", "SYSEXT_SCOPE": "system"},
+			class: Sysext,
+		},
+		{
+			name:    "SYSEXT_SCOPE initrd portable rejected",
+			host:    Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:     Fields{"ID": "alpine", "VERSION_ID": "3.20", "SYSEXT_SCOPE": "initrd portable"},
+			class:   Sysext,
+			wantErr: "SYSEXT_SCOPE",
+		},
+		{
+			name:  "SYSEXT_SCOPE system initrd is OK",
+			host:  Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:   Fields{"ID": "alpine", "VERSION_ID": "3.20", "SYSEXT_SCOPE": "system initrd"},
+			class: Sysext,
+		},
+		{
+			name:    "SYSEXT_SCOPE only portable rejected",
+			host:    Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:     Fields{"ID": "alpine", "VERSION_ID": "3.20", "SYSEXT_SCOPE": "portable"},
+			class:   Sysext,
+			wantErr: "SYSEXT_SCOPE",
+		},
+		{
+			name:  "SYSEXT_SCOPE with extra whitespace is OK",
+			host:  Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:   Fields{"ID": "alpine", "VERSION_ID": "3.20", "SYSEXT_SCOPE": "  initrd \t system  "},
+			class: Sysext,
+		},
+		{
+			name:  "SYSEXT_SCOPE whitespace-only treated as empty",
+			host:  Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:   Fields{"ID": "alpine", "VERSION_ID": "3.20", "SYSEXT_SCOPE": "   \t "},
+			class: Sysext,
+		},
+		{
+			name:    "SYSEXT_SCOPE checked even with ID _any",
+			host:    Fields{"ID": "alpine"},
+			ext:     Fields{"ID": "_any", "SYSEXT_SCOPE": "initrd"},
+			class:   Sysext,
+			wantErr: "SYSEXT_SCOPE",
+		},
+		{
+			name:    "confext uses CONFEXT_SCOPE",
+			host:    Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:     Fields{"ID": "alpine", "VERSION_ID": "3.20", "CONFEXT_SCOPE": "initrd"},
+			class:   Confext,
+			wantErr: "CONFEXT_SCOPE",
+		},
+		{
+			name:  "confext ignores SYSEXT_SCOPE",
+			host:  Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:   Fields{"ID": "alpine", "VERSION_ID": "3.20", "SYSEXT_SCOPE": "initrd"},
+			class: Confext,
+		},
+		{
+			name:  "sysext ignores CONFEXT_SCOPE",
+			host:  Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:   Fields{"ID": "alpine", "VERSION_ID": "3.20", "CONFEXT_SCOPE": "initrd"},
+			class: Sysext,
+		},
+		{
+			name:  "confext CONFEXT_SCOPE system is OK",
+			host:  Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+			ext:   Fields{"ID": "alpine", "VERSION_ID": "3.20", "CONFEXT_SCOPE": "system portable"},
+			class: Confext,
+		},
 	}
 
 	for _, tc := range tests {
@@ -381,6 +472,21 @@ func TestMatchErrorNamesBothValues(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	for _, want := range []string{"debian", "alpine", "ID"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err, want)
+		}
+	}
+}
+
+func TestMatchScopeErrorNamesFieldAndValue(t *testing.T) {
+	err := Match(
+		Fields{"ID": "alpine", "VERSION_ID": "3.20"},
+		Fields{"ID": "alpine", "VERSION_ID": "3.20", "SYSEXT_SCOPE": "initrd portable"},
+		Sysext, "x86-64")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, want := range []string{"SYSEXT_SCOPE", "initrd portable", "system"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q missing %q", err, want)
 		}

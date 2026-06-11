@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 
+	extconf "github.com/itxaka/sysext-alpine/internal/config"
 	"github.com/itxaka/sysext-alpine/internal/discover"
 	"github.com/itxaka/sysext-alpine/internal/image"
 	"github.com/itxaka/sysext-alpine/internal/overlay"
@@ -38,7 +40,7 @@ type config struct {
 	force         bool   // --force
 	noExec        bool   // --noexec= (default true; only meaningful for confext)
 	jsonMode      string // --json=short|pretty|off
-	noReload      bool   // --no-reload (accepted; reload is a no-op on Alpine)
+	noReload      bool   // --no-reload (suppress OpenRC dependency-cache refresh)
 	alwaysRefresh bool   // --always-refresh=yes|no
 	mutable       string // --mutable= mode (default "no")
 	imagePolicy   string // --image-policy= (raw policy string; "" = default)
@@ -46,6 +48,12 @@ type config struct {
 	showHelp      bool   // -h/--help
 	showVersion   bool   // --version
 	verb          string // status|merge|unmerge|refresh|list
+
+	// mutableSet/imagePolicySet record whether the corresponding option was
+	// given explicitly on the command line. When false, the value from
+	// sysext.conf(5) (if any) applies, falling back to the built-in default.
+	mutableSet     bool
+	imagePolicySet bool
 }
 
 // classFromArgv0 selects confext behavior when the binary is invoked through
@@ -92,7 +100,6 @@ func parseArgs(args []string) (*config, error) {
 		progName: "sysext",
 		noExec:   true,
 		jsonMode: jsonOff,
-		mutable:  "no",
 		verb:     "status",
 	}
 	if len(args) > 0 && args[0] != "" {
@@ -186,8 +193,10 @@ func parseArgs(args []string) (*config, error) {
 				return cfg, nil
 			}
 			cfg.mutable = m
+			cfg.mutableSet = true
 		case "image-policy":
 			cfg.imagePolicy = value
+			cfg.imagePolicySet = true
 		case "no-pager":
 			// Accepted for compatibility; we never page output.
 		case "no-legend":
@@ -235,6 +244,16 @@ func runWith(args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 
+	// sysext.conf(5): file configuration provides defaults; explicit
+	// command-line options take precedence.
+	fileCfg, err := extconf.Load(cfg.class, cfg.root)
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+	if err := applyFileConfig(cfg, fileCfg); err != nil {
+		return err
+	}
+
 	c := &cli{cfg: cfg, stdout: stdout, stderr: stderr}
 	switch cfg.verb {
 	case "status":
@@ -250,6 +269,27 @@ func runWith(args []string, stdout, stderr io.Writer) error {
 	}
 	// Unreachable: parseArgs validates the verb.
 	return fmt.Errorf("unknown command verb '%s'", cfg.verb)
+}
+
+// applyFileConfig fills options not given explicitly on the command line
+// from the sysext.conf(5)/confext.conf(5) configuration, falling back to the
+// built-in defaults (Mutable=no, no image policy). Config-supplied Mutable=
+// values are validated like --mutable=, except that "help" is rejected.
+func applyFileConfig(cfg *config, fileCfg extconf.Config) error {
+	if !cfg.mutableSet {
+		cfg.mutable = "no" // built-in default
+		if fileCfg.Mutable != "" {
+			m, err := parseMutableMode(fileCfg.Mutable)
+			if err != nil || m == "help" {
+				return fmt.Errorf("invalid Mutable= value '%s' in configuration file", fileCfg.Mutable)
+			}
+			cfg.mutable = m
+		}
+	}
+	if !cfg.imagePolicySet && fileCfg.ImagePolicy != "" {
+		cfg.imagePolicy = fileCfg.ImagePolicy
+	}
+	return nil
 }
 
 // printUsage emits help modeled after `systemd-sysext --help`.
@@ -275,7 +315,8 @@ Options:
      --root=PATH           Operate relative to root path
      --force               Ignore version incompatibilities
      --noexec=BOOL         Whether to mount extension overlay with noexec
-     --no-reload           Do not reload the service manager (no-op here)
+     --no-reload           Do not reload the service manager (OpenRC
+                           dependency cache) after merging
      --always-refresh=yes|no
                            Refresh even when the merged set is unchanged
      --mutable=no|auto|yes|import|ephemeral|ephemeral-import
@@ -297,11 +338,60 @@ func mustBeRoot() error {
 	return nil
 }
 
-// noteNoReload emits the debug note for the accepted-but-no-op --no-reload.
+// noteNoReload emits the debug note when --no-reload suppresses the service
+// manager reload (OpenRC dependency-cache refresh).
 func (c *cli) noteNoReload() {
 	if c.cfg.noReload {
 		fmt.Fprintln(c.stderr,
-			"Debug: --no-reload specified, but service manager reload is a no-op on this system.")
+			"Debug: --no-reload specified, skipping service manager reload.")
+	}
+}
+
+// wantsReload reports whether one extension-release requests a service
+// manager reload via EXTENSION_RELOAD_MANAGER=1 (systemd semantics; the
+// value is compared after trimming whitespace).
+func wantsReload(ext release.Fields) bool {
+	return strings.TrimSpace(ext["EXTENSION_RELOAD_MANAGER"]) == "1"
+}
+
+// shouldReloadManager is the pure reload decision: reload only when at least
+// one merged extension requested it and --no-reload was not given.
+func shouldReloadManager(requested, noReload bool) bool {
+	return requested && !noReload
+}
+
+// reloadServiceManager is the OpenRC analog of systemd's manager reload:
+// refresh the service dependency cache (`rc-update -u`) so init scripts
+// shipped by extensions (especially confexts adding /etc/init.d entries) are
+// picked up. Skipped silently (with a debug note) when rc-update is not in
+// PATH or <root>/run/openrc does not exist — i.e. not a (running) OpenRC
+// system. A failed refresh is reported as a warning, not an error.
+func (c *cli) reloadServiceManager() {
+	if _, err := os.Stat(filepath.Join(c.cfg.root, "/run/openrc")); err != nil {
+		fmt.Fprintln(c.stderr,
+			"Debug: /run/openrc not found, skipping service manager reload.")
+		return
+	}
+	rcUpdate, err := exec.LookPath("rc-update")
+	if err != nil {
+		fmt.Fprintln(c.stderr,
+			"Debug: rc-update not found in PATH, skipping service manager reload.")
+		return
+	}
+	if out, err := exec.Command(rcUpdate, "-u").CombinedOutput(); err != nil {
+		fmt.Fprintf(c.stderr, "Warning: failed to refresh OpenRC dependency cache: %v: %s\n",
+			err, strings.TrimSpace(string(out)))
+	}
+}
+
+// maybeReloadManager applies the reload decision after a successful merge.
+func (c *cli) maybeReloadManager(requested bool) {
+	if c.cfg.noReload {
+		c.noteNoReload()
+		return
+	}
+	if shouldReloadManager(requested, c.cfg.noReload) {
+		c.reloadServiceManager()
 	}
 }
 
@@ -311,8 +401,9 @@ func (c *cli) cmdStatus() error {
 	if err != nil {
 		return err
 	}
+	sortStatuses(statuses) // alphabetical hierarchy order, like systemd
 	if c.cfg.jsonMode != jsonOff {
-		out, err := renderJSON(statuses, c.cfg.jsonMode)
+		out, err := renderJSON(toStatusJSON(statuses), c.cfg.jsonMode)
 		if err != nil {
 			return err
 		}
@@ -377,6 +468,12 @@ func (c *cli) cmdMerge() error {
 }
 
 // cmdUnmerge implements `unmerge`. overlay.Unmerge is idempotent.
+//
+// Divergence from systemd: systemd also reloads the service manager on
+// unmerge when the previously merged set had requested it. Detecting that
+// here would require re-reading the extension-release files of the images
+// recorded in the marker origin before unmerging; we skip reload detection
+// on unmerge entirely (the --no-reload note is still printed).
 func (c *cli) cmdUnmerge() error {
 	if err := mustBeRoot(); err != nil {
 		return err
@@ -452,11 +549,20 @@ func shouldSkipRefresh(discovered []string, mergedSets [][]string, alwaysRefresh
 	return anyMerged
 }
 
-// merge validates (unless --force) and mounts the overlays.
+// merge validates (unless --force) and mounts the overlays, then refreshes
+// the service manager (OpenRC dependency cache) if any merged extension
+// requested it via EXTENSION_RELOAD_MANAGER=1.
+//
+// Divergence from systemd: with --force validation is skipped entirely, so
+// the extension-release files are never read and EXTENSION_RELOAD_MANAGER
+// detection is skipped too (systemd still reads the files when forcing).
 func (c *cli) merge(images []discover.Image) error {
 	arch := release.HostArchitecture()
+	reloadRequested := false
 	if !c.cfg.force {
-		if err := c.validateImages(images, arch); err != nil {
+		var err error
+		reloadRequested, err = c.validateImages(images, arch)
+		if err != nil {
 			return err
 		}
 	}
@@ -471,18 +577,21 @@ func (c *cli) merge(images []discover.Image) error {
 	if err != nil {
 		return err
 	}
-	c.noteNoReload()
+	c.maybeReloadManager(reloadRequested)
 	return nil
 }
 
 // validateImages checks every image's extension-release against the host
 // os-release (SPEC §2). Directory images are inspected in place; raw images
-// must be mounted first to expose their release file.
-func (c *cli) validateImages(images []discover.Image, arch string) error {
+// must be mounted first to expose their release file. The boolean result
+// reports whether any extension requested a service manager reload via
+// EXTENSION_RELOAD_MANAGER=1.
+func (c *cli) validateImages(images []discover.Image, arch string) (bool, error) {
 	host, err := release.HostOSRelease(c.cfg.root)
 	if err != nil {
-		return fmt.Errorf("failed to read host os-release: %w", err)
+		return false, fmt.Errorf("failed to read host os-release: %w", err)
 	}
+	reloadRequested := false
 	for _, img := range images {
 		var ext release.Fields
 		switch img.Type {
@@ -492,14 +601,17 @@ func (c *cli) validateImages(images []discover.Image, arch string) error {
 			ext, err = release.FindExtensionRelease(img.Path, img.Name, c.cfg.class)
 		}
 		if err != nil {
-			return fmt.Errorf("extension '%s': %w", img.Name, err)
+			return false, fmt.Errorf("extension '%s': %w", img.Name, err)
 		}
 		if err := release.Match(host, ext, c.cfg.class, arch); err != nil {
-			return fmt.Errorf("extension '%s' is not compatible with the host: %w",
+			return false, fmt.Errorf("extension '%s' is not compatible with the host: %w",
 				img.Name, err)
 		}
+		if wantsReload(ext) {
+			reloadRequested = true
+		}
 	}
-	return nil
+	return reloadRequested, nil
 }
 
 // rawExtensionRelease mounts a raw image at a temporary mount point under

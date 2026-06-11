@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -42,6 +43,15 @@ func (c Class) LevelField() string {
 		return "CONFEXT_LEVEL"
 	}
 	return "SYSEXT_LEVEL"
+}
+
+// ScopeField returns the scope field name for the class
+// (SYSEXT_SCOPE or CONFEXT_SCOPE).
+func (c Class) ScopeField() string {
+	if c == Confext {
+		return "CONFEXT_SCOPE"
+	}
+	return "SYSEXT_SCOPE"
 }
 
 // Fields is a parsed os-release / extension-release key=value map.
@@ -292,6 +302,18 @@ func Match(host, ext Fields, class Class, arch string) error {
 		if extArch != arch {
 			return fmt.Errorf("extension ARCHITECTURE %q does not match host architecture %q",
 				extArch, arch)
+		}
+	}
+
+	// Scope check: we always run on a booted system, so a non-empty
+	// SYSEXT_SCOPE/CONFEXT_SCOPE (whitespace-separated list) must contain
+	// "system". An absent or empty field means no restriction.
+	scopeField := class.ScopeField()
+	if scopeValue, defined := ext[scopeField]; defined {
+		scopes := strings.Fields(scopeValue)
+		if len(scopes) > 0 && !slices.Contains(scopes, "system") {
+			return fmt.Errorf("extension %s %q does not include the %q scope required on a booted system",
+				scopeField, scopeValue, "system")
 		}
 	}
 

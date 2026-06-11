@@ -122,9 +122,12 @@ func MountWithOpts(img discover.Image, mountPoint string, opts MountOpts) (*Moun
 // Bare-filesystem images carry no verity metadata: they classify as an
 // unprotected root payload and the policy must allow that.
 func mountBareFS(path, mountPoint string, fs FSType, policy *imagePolicy) (*Mounted, error) {
-	if !policy.root[protUnprotected] {
+	if allowed := policy.forDesignator("root"); !allowed[protUnprotected] {
 		return nil, fmt.Errorf("%s: %w", path,
-			policyError("root", protUnprotected, policy.root))
+			policyError("root", protUnprotected, allowed))
+	}
+	if err := policy.checkFS("root", fs); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 
 	loopDev, err := loopAttach(path, false)
@@ -232,6 +235,10 @@ func mountGPT(path, mountPoint, arch string, policy *imagePolicy, trustDir strin
 	if fs == FSUnknown || fs == FSGPT {
 		cleanup()
 		return nil, fmt.Errorf("%s: partition %d has unsupported filesystem", path, part.Index)
+	}
+	if err := policy.checkFS(designator, fs); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 
 	target := mountPoint

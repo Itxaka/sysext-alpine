@@ -23,13 +23,71 @@ import (
 // ErrAlreadyMerged is returned by Merge when a hierarchy is already merged.
 var ErrAlreadyMerged = errors.New("already merged")
 
-// Hierarchies returns the merge targets for the class:
-// Sysext: ["/usr", "/opt"]; Confext: ["/etc"].
+// Environment variables overriding the default merge hierarchies, matching
+// systemd-sysext/systemd-confext: a colon-separated list of absolute paths.
+const (
+	envSysextHierarchies  = "SYSTEMD_SYSEXT_HIERARCHIES"
+	envConfextHierarchies = "SYSTEMD_CONFEXT_HIERARCHIES"
+)
+
+// Hierarchies returns the merge targets for the class. Defaults are
+// Sysext: ["/usr", "/opt"]; Confext: ["/etc"]. Like systemd, the defaults can
+// be overridden via SYSTEMD_SYSEXT_HIERARCHIES / SYSTEMD_CONFEXT_HIERARCHIES,
+// a colon-separated list of absolute paths. An empty or unset variable keeps
+// the defaults; an invalid value (relative entry, uncleaned path, "/",
+// duplicate, empty entry) logs a warning to stderr and falls back to the
+// defaults entirely.
 func Hierarchies(class release.Class) []string {
+	env, def := envSysextHierarchies, []string{"/usr", "/opt"}
 	if class == release.Confext {
-		return []string{"/etc"}
+		env, def = envConfextHierarchies, []string{"/etc"}
 	}
-	return []string{"/usr", "/opt"}
+	value := os.Getenv(env)
+	if value == "" {
+		return def
+	}
+	parsed, err := parseHierarchiesEnv(value)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q: %v\n", env, value, err)
+		return def
+	}
+	if len(parsed) == 0 {
+		return def
+	}
+	return parsed
+}
+
+// parseHierarchiesEnv parses a colon-separated hierarchy list from the
+// SYSTEMD_{SYSEXT,CONFEXT}_HIERARCHIES environment variables. Every entry
+// must be an absolute, already-cleaned path other than "/", with no
+// duplicates. An empty value parses to nil (caller falls back to defaults).
+// Pure; unit-tested.
+func parseHierarchiesEnv(value string) ([]string, error) {
+	if value == "" {
+		return nil, nil
+	}
+	seen := make(map[string]bool)
+	var hierarchies []string
+	for _, entry := range strings.Split(value, ":") {
+		if entry == "" {
+			return nil, errors.New("empty hierarchy entry")
+		}
+		if !filepath.IsAbs(entry) {
+			return nil, fmt.Errorf("hierarchy %q is not an absolute path", entry)
+		}
+		if filepath.Clean(entry) != entry {
+			return nil, fmt.Errorf("hierarchy %q is not a cleaned path", entry)
+		}
+		if entry == "/" {
+			return nil, errors.New(`hierarchy "/" is not allowed`)
+		}
+		if seen[entry] {
+			return nil, fmt.Errorf("duplicate hierarchy %q", entry)
+		}
+		seen[entry] = true
+		hierarchies = append(hierarchies, entry)
+	}
+	return hierarchies, nil
 }
 
 // Workspace returns the runtime workspace dir for the class under root:
@@ -301,10 +359,19 @@ func (s *mergeState) rollback() {
 //
 // Fails (ErrAlreadyMerged) if any target hierarchy is already merged by us.
 // On error, everything mounted so far is rolled back.
+//
+// Merge holds the per-class Lock for its whole duration, serializing against
+// concurrent Merge/Unmerge in other processes. A caller doing unmerge+merge
+// (refresh) gets two separate critical sections — see Lock.
 func Merge(class release.Class, images []discover.Image, opts MergeOptions) error {
 	if _, err := normalizeMutableMode(opts.Mutable); err != nil {
 		return err
 	}
+	unlock, err := Lock(class, opts.Root)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	for _, h := range Hierarchies(class) {
 		merged, err := IsMergedByUs(class, opts.Root, h)
 		if err != nil {
@@ -555,7 +622,16 @@ func collectRawOriginPaths(class release.Class, ws string) []string {
 // merged by us, unmount the overlay (MNT_DETACH fallback), then unmount image
 // mounts and detach loop devices, then remove workspace dirs. Idempotent —
 // returns nil when nothing is merged.
+//
+// Unmerge holds the per-class Lock for its whole duration, serializing
+// against concurrent Merge/Unmerge in other processes — see Lock.
 func Unmerge(class release.Class, root string) error {
+	unlock, err := Lock(class, root)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	var errs []error
 	for _, h := range Hierarchies(class) {
 		merged, err := IsMergedByUs(class, root, h)
