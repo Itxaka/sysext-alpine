@@ -1,16 +1,18 @@
 # Example signed sysext
 
-`signed-example.raw` is a genuine `systemd-repart --make-ddi=sysext` artifact:
-a GPT DDI with root (erofs payload), root-verity (dm-verity hash tree) and
-root-verity-sig (PKCS#7 signature) partitions. It doubles as documentation
-and as the default interoperability fixture for `test/e2e/inner-signed.sh`.
+`make-signed-sysext.sh` builds `signed-example.raw`, a genuine
+`systemd-repart --make-ddi=sysext` artifact: a GPT DDI with root (erofs
+payload), root-verity (dm-verity hash tree) and root-verity-sig (PKCS#7
+signature) partitions. It doubles as documentation and as the default
+interoperability fixture for `test/e2e/inner-signed.sh` (the suite SKIPs
+the interop part when the image hasn't been built).
 
 > **The keys in `keys/` are public test keys, committed on purpose so anyone
 > can verify and rebuild the example. Treat them as compromised; never sign
 > anything real with them.**
 
-Regenerate everything with `./make-signed-sysext.sh` (needs `openssl` and
-`systemd-repart`, runs unprivileged).
+The image itself is not committed — build it with `make example` (needs
+`openssl` and `systemd-repart`, runs unprivileged).
 
 ## Try it
 

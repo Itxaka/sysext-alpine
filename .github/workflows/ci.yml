@@ -31,6 +31,13 @@ jobs:
         with:
           name: coverage-unit
           path: coverage.out
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.out
+          flags: unit
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
   build:
     runs-on: ubuntu-latest
@@ -67,6 +74,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Build the signed example DDI so the interop part of inner-signed.sh
+      # runs (it SKIPs gracefully when systemd-repart is unavailable).
+      - name: Build signed example
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q erofs-utils systemd-repart || \
+            sudo apt-get install -y -q erofs-utils || true
+          if command -v systemd-repart >/dev/null; then
+            make example
+          else
+            echo "systemd-repart unavailable; interop fixture test will SKIP"
+          fi
       # Privileged Alpine container with /lib/modules mounted; suites that
       # need a kernel module unavailable on the runner (e.g. erofs) SKIP.
       # Runs with a coverage-instrumented binary (make e2e-cover) so the
@@ -85,3 +104,10 @@ jobs:
         with:
           name: coverage-e2e
           path: coverage-e2e.out
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage-e2e.out
+          flags: e2e
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

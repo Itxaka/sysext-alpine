@@ -1,0 +1,28 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "gomod": {
+    "postUpdateOptions": ["gomodTidy"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Alpine image used by the e2e harness (test/e2e/run.sh)",
+      "managerFilePatterns": ["/^test/e2e/run\\.sh$/"],
+      "matchStrings": ["IMAGE=\\$\\{IMAGE:-(?<depName>alpine):(?<currentValue>[^}]+)\\}"],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["gomod"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "go dependencies"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    }
+  ]
+}

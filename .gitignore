@@ -1,10 +1,9 @@
 # Build output (root-level only — examples/ contains a usr/bin payload)
 /bin/
 
-# Test extension images
+# Test extension images (the signed example is regenerated, not committed:
+# run examples/make-signed-sysext.sh or `make example`)
 *.raw
-# ... except the committed signed example (public test keys, see examples/)
-!examples/signed-example.raw
 
 # Go test artifacts
 *.test

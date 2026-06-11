@@ -22,6 +22,10 @@ build-all:
 test:
 	go test ./...
 
+# Regenerate the example signed sysext (needs openssl + systemd-repart).
+example:
+	./examples/make-signed-sysext.sh
+
 # Unit-test coverage: per-function summary + HTML report.
 cover:
 	go test -coverprofile=coverage.out -covermode=atomic ./...
