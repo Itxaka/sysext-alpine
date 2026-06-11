@@ -68,13 +68,19 @@ func TestLockBlocksConcurrentHolder(t *testing.T) {
 
 	unlock()
 
-	// After release it must go through promptly.
+	// After release it must go through promptly. Don't select on errCh
+	// here: on success the goroutine both closes acquired AND sends nil to
+	// errCh, and select picks randomly among ready channels — selecting
+	// the nil error would be a spurious failure (seen on slow CI runners).
 	select {
 	case <-acquired:
-	case err := <-errCh:
-		t.Fatalf("second Lock failed: %v", err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("second Lock still blocked after release")
+		select {
+		case err := <-errCh:
+			t.Fatalf("second Lock failed: %v", err)
+		default:
+			t.Fatal("second Lock still blocked after release")
+		}
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("second unlock path: %v", err)
