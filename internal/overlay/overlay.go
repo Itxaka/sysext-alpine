@@ -65,6 +65,15 @@ type MergeOptions struct {
 	NoExec bool   // confext only; default true (apply MS_NOEXEC)
 	Force  bool   // informational; version checks happen in caller
 	Arch   string // host architecture (release.HostArchitecture())
+
+	// Mutable is the --mutable= mode: "no" (default; "" treated as "no"),
+	// "auto", "yes", "import", "ephemeral", "ephemeral-import".
+	// See docs/SPEC.md "Mutability".
+	Mutable string
+
+	// ImagePolicy is the systemd.image-policy(7) string applied when
+	// mounting raw disk images ("" = class default).
+	ImagePolicy string
 }
 
 // escapeHierarchy turns a hierarchy path into a workspace directory name:
@@ -320,7 +329,7 @@ func doMerge(class release.Class, images []discover.Image, opts MergeOptions, st
 		if err := os.MkdirAll(mp, 0o755); err != nil {
 			return fmt.Errorf("creating image mount point %s: %w", mp, err)
 		}
-		m, err := image.Mount(img, mp, opts.Arch)
+		m, err := image.MountWithOpts(img, mp, image.MountOpts{Arch: opts.Arch, Policy: opts.ImagePolicy})
 		if err != nil {
 			return fmt.Errorf("mounting image %s: %w", img.Name, err)
 		}

@@ -55,8 +55,25 @@ func Detect(path string) (FSType, error) {
 	return detectPath(path)
 }
 
-// Mount makes the image's tree available at mountPoint (which must exist)
-// and returns a Mounted handle.
+// MountOpts tunes MountWithOpts.
+type MountOpts struct {
+	// Arch is the host architecture in systemd notation ("x86-64", ...);
+	// selects the GPT partition type GUIDs.
+	Arch string
+	// Policy is the systemd.image-policy(7) string applied to disk images
+	// ("" = the class default policy). Enforced for GPT DDIs with verity
+	// partitions; bare-filesystem images count as "unprotected".
+	Policy string
+}
+
+// Mount makes the image's tree available at mountPoint with the default
+// image policy. See MountWithOpts.
+func Mount(img discover.Image, mountPoint, arch string) (*Mounted, error) {
+	return MountWithOpts(img, mountPoint, MountOpts{Arch: arch})
+}
+
+// MountWithOpts makes the image's tree available at mountPoint (which must
+// exist) and returns a Mounted handle.
 //
 //   - TypeDirectory: no mount; Root = img.Path.
 //   - TypeRaw bare filesystem: loop-attach read-only, mount at mountPoint.
@@ -65,7 +82,8 @@ func Detect(path string) (FSType, error) {
 //     is synthesized so the payload appears under <mountPoint>/usr).
 //
 // On any error all intermediate resources are released.
-func Mount(img discover.Image, mountPoint, arch string) (*Mounted, error) {
+func MountWithOpts(img discover.Image, mountPoint string, opts MountOpts) (*Mounted, error) {
+	arch := opts.Arch
 	if img.Type == discover.TypeDirectory {
 		return &Mounted{Root: img.Path}, nil
 	}

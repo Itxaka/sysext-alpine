@@ -40,6 +40,8 @@ type config struct {
 	jsonMode      string // --json=short|pretty|off
 	noReload      bool   // --no-reload (accepted; reload is a no-op on Alpine)
 	alwaysRefresh bool   // --always-refresh=yes|no
+	mutable       string // --mutable= mode (default "no")
+	imagePolicy   string // --image-policy= (raw policy string; "" = default)
 	noLegend      bool   // --no-legend
 	showHelp      bool   // -h/--help
 	showVersion   bool   // --version
@@ -66,6 +68,23 @@ func parseBool(s string) (bool, error) {
 	return false, fmt.Errorf("invalid boolean value '%s'", s)
 }
 
+// parseMutableMode normalizes a --mutable= argument: boolean spellings map
+// to yes/no, the named modes and "help" pass through.
+func parseMutableMode(s string) (string, error) {
+	switch s {
+	case "auto", "import", "ephemeral", "ephemeral-import", "help":
+		return s, nil
+	}
+	b, err := parseBool(s)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse --mutable= argument: invalid mode '%s'", s)
+	}
+	if b {
+		return "yes", nil
+	}
+	return "no", nil
+}
+
 // parseArgs parses the full argv (args[0] = program name). -h/--help and
 // --version short-circuit, like getopt-based systemd tools.
 func parseArgs(args []string) (*config, error) {
@@ -73,6 +92,7 @@ func parseArgs(args []string) (*config, error) {
 		progName: "sysext",
 		noExec:   true,
 		jsonMode: jsonOff,
+		mutable:  "no",
 		verb:     "status",
 	}
 	if len(args) > 0 && args[0] != "" {
@@ -104,7 +124,8 @@ func parseArgs(args []string) (*config, error) {
 
 		var takesValue bool
 		switch name {
-		case "root", "noexec", "json", "always-refresh":
+		case "root", "noexec", "json", "always-refresh", "mutable",
+			"image-policy":
 			takesValue = true
 		case "force", "no-reload", "no-pager", "no-legend", "confext",
 			"help", "version":
@@ -155,6 +176,18 @@ func parseArgs(args []string) (*config, error) {
 				return nil, fmt.Errorf("failed to parse --always-refresh= argument: %w", err)
 			}
 			cfg.alwaysRefresh = b
+		case "mutable":
+			m, err := parseMutableMode(value)
+			if err != nil {
+				return nil, err
+			}
+			if m == "help" {
+				cfg.showHelp = true // caller prints the list via usage
+				return cfg, nil
+			}
+			cfg.mutable = m
+		case "image-policy":
+			cfg.imagePolicy = value
 		case "no-pager":
 			// Accepted for compatibility; we never page output.
 		case "no-legend":
@@ -245,6 +278,9 @@ Options:
      --no-reload           Do not reload the service manager (no-op here)
      --always-refresh=yes|no
                            Refresh even when the merged set is unchanged
+     --mutable=no|auto|yes|import|ephemeral|ephemeral-import
+                           Set mutability mode (default: no)
+     --image-policy=POLICY Apply image dissection policy to disk images
      --confext             Operate on configuration extensions (/etc/)
      --no-pager            Do not pipe output into a pager
      --no-legend           Do not show the headers and footers
@@ -425,10 +461,12 @@ func (c *cli) merge(images []discover.Image) error {
 		}
 	}
 	err := overlay.Merge(c.cfg.class, images, overlay.MergeOptions{
-		Root:   c.cfg.root,
-		NoExec: c.cfg.noExec,
-		Force:  c.cfg.force,
-		Arch:   arch,
+		Root:        c.cfg.root,
+		NoExec:      c.cfg.noExec,
+		Force:       c.cfg.force,
+		Arch:        arch,
+		Mutable:     c.cfg.mutable,
+		ImagePolicy: c.cfg.imagePolicy,
 	})
 	if err != nil {
 		return err
@@ -479,7 +517,8 @@ func (c *cli) rawExtensionRelease(img discover.Image, arch string) (release.Fiel
 	}
 	defer os.RemoveAll(mountPoint)
 
-	m, err := image.Mount(img, mountPoint, arch)
+	m, err := image.MountWithOpts(img, mountPoint,
+		image.MountOpts{Arch: arch, Policy: c.cfg.imagePolicy})
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount for validation: %w", err)
 	}

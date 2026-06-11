@@ -290,7 +290,7 @@ func TestArchGUIDMapping(t *testing.T) {
 	want := map[string][2]string{
 		"x86-64":  {"4f68bce3-e8cd-4db1-96e7-fbcaf984b709", "8484680c-9521-48c6-9c11-b0720656f69e"},
 		"arm64":   {"b921b045-1df0-41c3-af44-4c6f280d3fae", "b0e01050-ee5f-4390-949a-9101b17104e9"},
-		"riscv64": {"72ec70a6-cf74-40e6-bd49-4bda08e8f224", "b6ed5582-440b-4209-b8da-5ff7c419ea3d"},
+		"riscv64": {"72ec70a6-cf74-40e6-bd49-4bda08e8f224", "beaec34b-8442-439b-a40b-984381ed097d"},
 	}
 	if len(archGUIDs) != len(want) {
 		t.Errorf("archGUIDs has %d entries, want %d", len(archGUIDs), len(want))
