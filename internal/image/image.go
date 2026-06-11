@@ -70,6 +70,10 @@ type MountOpts struct {
 	// ("" = the class default policy). Enforced for GPT DDIs with verity
 	// partitions; bare-filesystem images count as "unprotected".
 	Policy string
+	// TrustDir is the directory holding trusted PEM certificates (*.crt)
+	// for verity signature verification ("" = /etc/verity.d). See
+	// internal/image/signature.go for the trust model.
+	TrustDir string
 }
 
 // Mount makes the image's tree available at mountPoint with the default
@@ -108,7 +112,7 @@ func MountWithOpts(img discover.Image, mountPoint string, opts MountOpts) (*Moun
 	case FSSquashfs, FSErofs, FSExt4:
 		return mountBareFS(img.Path, mountPoint, fs, policy)
 	case FSGPT:
-		return mountGPT(img.Path, mountPoint, arch, policy)
+		return mountGPT(img.Path, mountPoint, arch, policy, opts.TrustDir)
 	default:
 		return nil, fmt.Errorf("%s: unrecognized image format", img.Path)
 	}
@@ -140,10 +144,11 @@ func mountBareFS(path, mountPoint string, fs FSType, policy *imagePolicy) (*Moun
 }
 
 // mountGPT parses the partition table, enforces the image policy, attaches
-// the image with partition scanning, sets up dm-verity when the image
-// carries a verity partition (and the policy allows it), and mounts the
-// payload read-only.
-func mountGPT(path, mountPoint, arch string, policy *imagePolicy) (*Mounted, error) {
+// the image with partition scanning, verifies the verity root-hash
+// signature when present (and the policy accepts "signed"), sets up
+// dm-verity when the image carries a verity partition (and the policy
+// allows it), and mounts the payload read-only.
+func mountGPT(path, mountPoint, arch string, policy *imagePolicy, trustDir string) (*Mounted, error) {
 	parts, err := parseGPTFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("parsing GPT of %s: %w", path, err)
@@ -159,7 +164,7 @@ func mountGPT(path, mountPoint, arch string, policy *imagePolicy) (*Mounted, err
 		designator = "usr"
 	}
 
-	useVerity, err := decideVerity(parts, guids, designator, policy)
+	useVerity, checkSig, err := decideVerity(parts, guids, designator, policy)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
@@ -186,11 +191,30 @@ func mountGPT(path, mountPoint, arch string, policy *imagePolicy) (*Mounted, err
 	mountDev := partDev
 	verityDevPath := ""
 	if useVerity {
-		verityType := guids.rootVerity
+		verityType, sigType := guids.rootVerity, guids.rootVeritySig
 		if isUsr {
-			verityType = guids.usrVerity
+			verityType, sigType = guids.usrVerity, guids.usrVeritySig
 		}
 		vpart := findByType(parts, verityType) // non-nil: decideVerity classified it
+
+		if checkSig {
+			// Image classified as signed and the policy accepts signed:
+			// verify the PKCS#7 signature over the GUID-reconstructed
+			// root hash before activating verity with it.
+			if serr := verifyImageSignature(loopDev, parts, sigType, part, *vpart, trustDir); serr != nil {
+				if policy.forDesignator(designator)[protVerity] {
+					// Policy also accepts plain verity: degrade with a
+					// warning, hash tree still enforced.
+					fmt.Fprintf(os.Stderr,
+						"Warning: %s: verity signature verification failed, continuing as unsigned verity (policy allows verity): %v\n",
+						path, serr)
+				} else {
+					cleanup()
+					return nil, fmt.Errorf("%s: verity signature verification failed: %w", path, serr)
+				}
+			}
+		}
+
 		verityDevPath, err = setupVerity(path, loopDev, part, *vpart, partDev)
 		if err != nil {
 			cleanup()
@@ -238,50 +262,54 @@ func mountGPT(path, mountPoint, arch string, policy *imagePolicy) (*Mounted, err
 
 // decideVerity applies the image policy to the actual protection level of
 // the selected designator and reports whether dm-verity should be used
-// (true), the data partition mounted directly (false), or the image
-// rejected (error).
+// (useVerity), whether the verity root-hash signature must be verified
+// first (checkSig), or whether the image is rejected (error).
 //
-// Like systemd, protected access is preferred when the policy allows both:
-// verity is used whenever a usable verity partition exists and the policy
-// permits verity. Signature partitions raise the classification to
-// "signed", but PKCS#7 signature verification is not implemented: a policy
-// that *only* accepts "signed" is rejected explicitly (see docs/VERITY.md).
-func decideVerity(parts []gptPartition, guids dpsGUIDs, designator string, policy *imagePolicy) (bool, error) {
+// Like systemd, the highest protection both sides accept is preferred:
+// when the image carries a verity signature partition and the policy
+// accepts "signed", the signature is verified (checkSig=true). If
+// verification later fails, the caller degrades to plain verity when the
+// policy also accepts "verity" (warning), otherwise the mount fails.
+// Signed images facing a policy that accepts "verity" but not "signed" are
+// mounted as plain verity without signature verification.
+func decideVerity(parts []gptPartition, guids dpsGUIDs, designator string, policy *imagePolicy) (useVerity, checkSig bool, err error) {
 	prot := classifyProtection(parts, guids, designator)
 	allowed := policy.forDesignator(designator)
 
 	switch prot {
 	case protUnprotected:
 		if !allowed[protUnprotected] {
-			return false, policyError(designator, prot, allowed)
+			return false, false, policyError(designator, prot, allowed)
 		}
-		return false, nil
+		return false, false, nil
 	case protVerity:
 		switch {
 		case allowed[protVerity]:
-			return true, nil
+			return true, false, nil
 		case allowed[protUnprotected]:
-			return false, nil
+			return false, false, nil
 		default:
 			// Policy accepts only signed/encrypted/absent: a plain
 			// verity image cannot satisfy it.
-			return false, policyError(designator, prot, allowed)
+			return false, false, policyError(designator, prot, allowed)
 		}
 	case protSigned:
 		switch {
+		case allowed[protSigned]:
+			// Verify the signature; on failure the caller degrades to
+			// plain verity iff allowed[protVerity].
+			return true, true, nil
 		case allowed[protVerity]:
 			// Treat the signed image as plain verity (signature not
 			// verified, hash tree still enforced).
-			return true, nil
-		case allowed[protSigned]:
-			return false, fmt.Errorf("image policy requires signed %s partition: signature verification not implemented", designator)
+			return true, false, nil
 		case allowed[protUnprotected]:
-			return false, nil
+			return false, false, nil
 		default:
-			return false, policyError(designator, prot, allowed)
+			return false, false, policyError(designator, prot, allowed)
 		}
 	default: // protAbsent cannot happen for the selected partition
-		return false, policyError(designator, prot, allowed)
+		return false, false, policyError(designator, prot, allowed)
 	}
 }
 

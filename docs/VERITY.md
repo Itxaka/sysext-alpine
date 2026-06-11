@@ -49,6 +49,59 @@ written by `veritysetup format` at offset 0 of the verity partition (magic
 data block count, salt). The hash tree starts at hash block 1 (the
 superblock occupies block 0).
 
+## Signature verification
+
+When the image also carries a **verity-signature partition** (type GUIDs
+`rootVeritySig`/`usrVeritySig` in `internal/image/gpt.go`), the
+classification rises to `signed` and the PKCS#7 signature over the verity
+root hash is verified (`internal/image/signature.go`).
+
+The signature partition contains a JSON object, NUL-padded to a multiple
+of 4096 bytes, per the UAPI Discoverable Partitions Specification:
+
+| Field | | Meaning |
+|---|---|---|
+| `rootHash` | mandatory | the verity root hash, lowercase hex |
+| `signature` | mandatory | base64-encoded DER PKCS#7 signature; the signed data is the exact ASCII hex string stored in `rootHash` (no newline) |
+| `certificateFingerprint` | optional | SHA256 of the signer certificate in DER form, lowercase hex without colons |
+
+**Trust model** (mirrors systemd's): trusted X.509 certificates are
+installed as PEM files matching `/etc/verity.d/*.crt` (with `--root=`, the
+directory is `<root>/etc/verity.d`; a file may hold multiple CERTIFICATE
+blocks). The signature is accepted when **all** of the following hold:
+
+1. the `rootHash` field equals the root hash reconstructed from the
+   partition GUIDs (the signature is always bound to that hash — embedded
+   PKCS#7 content is ignored),
+2. the PKCS#7 signature cryptographically verifies over the ASCII hex root
+   hash with exactly one signer,
+3. when `certificateFingerprint` is present, it matches the signer
+   certificate (mismatch is an error, not a warning),
+4. the signer certificate is within its validity period — **expiry is
+   honored**: an expired or not-yet-valid signer certificate is rejected
+   even if it is itself an installed trust anchor,
+5. the signer certificate is byte-identical to one of the trusted
+   certificates, **or** chains to one (Go `x509.Verify` with the trusted
+   certificates as roots and any further certificates in the PKCS#7
+   structure as intermediates; any extended key usage, no hostname checks).
+
+A missing or empty `/etc/verity.d` is an error ("no trust anchors") —
+verification can never succeed without a root of trust.
+
+**Policy interaction and degradation:** verification is attempted whenever
+the image classifies as `signed` and the policy accepts `signed` (the
+highest protection both sides accept is preferred — note that the default
+allow-all policy accepts `signed`, so signed images are verified by
+default). On verification **failure**:
+
+- if the policy *also* accepts `verity`, a warning is printed to stderr and
+  the image is mounted as a plain verity image (hash tree still enforced),
+- if the policy accepts `signed` but not `verity`, the mount fails.
+
+A policy that only accepts `signed` rejects unsigned images outright. A
+signed image facing a policy that accepts `verity` but not `signed` is
+mounted as plain verity without signature verification.
+
 ## Device-mapper activation
 
 No libdevmapper, no udev: the dm-verity device is created by issuing raw
@@ -109,7 +162,8 @@ Examples:
 ```sh
 sysext --image-policy=root=verity merge          # require verity for root payloads
 sysext --image-policy=root=verity+unprotected merge
-sysext --image-policy=root=signed merge          # currently always fails, see below
+sysext --image-policy=root=signed merge          # require a validated signature
+sysext --image-policy=root=signed+verity merge   # prefer signed, degrade to verity
 ```
 
 ## Security limitations
@@ -117,22 +171,22 @@ sysext --image-policy=root=signed merge          # currently always fails, see b
 These are deliberate scope limits — know them before relying on the
 feature:
 
-1. **Signature verification is NOT implemented.** Verity-signature
-   partitions are *detected* (raising the classification to `signed`), but
-   the PKCS#7 signature is never validated against any key. Consequences:
-   - A policy whose only acceptable level is `signed` is rejected with
-     `signature verification not implemented` rather than pretending to
-     verify.
-   - When the policy also allows `verity`, a signed image is treated as a
-     plain verity image: the hash tree is enforced, the signature is
-     ignored.
-   - This means there is **no root of trust**: the root hash comes from the
-     image itself (its partition GUIDs). dm-verity here protects against
-     *accidental corruption* and *post-publication tampering of the data
-     relative to its hash tree*, but an attacker who can replace the whole
-     image file can simply re-create consistent verity metadata. Only
-     signature verification against a trusted key (not implemented) would
-     close that hole.
+1. **A root of trust exists only with signature verification.** For plain
+   `verity` images the root hash comes from the image itself (its partition
+   GUIDs): dm-verity protects against *accidental corruption* and
+   *post-publication tampering of the data relative to its hash tree*, but
+   an attacker who can replace the whole image file can re-create
+   consistent verity metadata. Only a `signed` policy with certificates in
+   `/etc/verity.d/` closes that hole — and only as long as the trust
+   directory itself and the policy choice are out of the attacker's reach.
+   Note also:
+   - With a `signed+verity` policy a failed signature **degrades** to plain
+     verity with a warning instead of failing; use a signed-only policy
+     when the signature must be authoritative.
+   - Certificate **expiry is honored** (see "Signature verification"); no
+     revocation checking (CRL/OCSP) is performed.
+   - Certificates in `/etc/verity.d/` are trusted for signing regardless of
+     key-usage/EKU extensions beyond standard chain validity.
 2. **Encrypted (LUKS) images are unsupported.** `encrypted` is accepted in
    policy strings but never matches; an image that would need it fails the
    policy check.

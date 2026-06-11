@@ -342,7 +342,7 @@ func doMerge(class release.Class, images []discover.Image, opts MergeOptions, st
 		if err := os.MkdirAll(mp, 0o755); err != nil {
 			return fmt.Errorf("creating image mount point %s: %w", mp, err)
 		}
-		m, err := image.MountWithOpts(img, mp, image.MountOpts{Arch: opts.Arch, Policy: opts.ImagePolicy})
+		m, err := image.MountWithOpts(img, mp, image.MountOpts{Arch: opts.Arch, Policy: opts.ImagePolicy, TrustDir: filepath.Join(opts.Root, "/etc/verity.d")})
 		if err != nil {
 			return fmt.Errorf("mounting image %s: %w", img.Name, err)
 		}
@@ -431,8 +431,8 @@ func mergeHierarchy(class release.Class, images []discover.Image, roots []string
 	}
 	flags := overlayMountFlags(class, opts.NoExec)
 	if hm.upperDir != "" {
-		flags &^= unix.MS_RDONLY  // mutable overlay must be writable
-		flags |= unix.MS_NOATIME  // systemd's "noatime" mutable mount option
+		flags &^= unix.MS_RDONLY // mutable overlay must be writable
+		flags |= unix.MS_NOATIME // systemd's "noatime" mutable mount option
 	}
 	data := buildOverlayData(lower, hm.upperDir, hm.workDir)
 	if err := unix.Mount("overlay", staging, "overlay", flags, data); err != nil {

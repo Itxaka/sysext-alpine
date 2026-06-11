@@ -518,7 +518,7 @@ func (c *cli) rawExtensionRelease(img discover.Image, arch string) (release.Fiel
 	defer os.RemoveAll(mountPoint)
 
 	m, err := image.MountWithOpts(img, mountPoint,
-		image.MountOpts{Arch: arch, Policy: c.cfg.imagePolicy})
+		image.MountOpts{Arch: arch, Policy: c.cfg.imagePolicy, TrustDir: filepath.Join(c.cfg.root, "/etc/verity.d")})
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount for validation: %w", err)
 	}

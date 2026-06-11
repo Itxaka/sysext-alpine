@@ -153,21 +153,24 @@ func TestDecideVerity(t *testing.T) {
 		parts     []gptPartition
 		policy    string
 		useVerity bool
+		checkSig  bool
 		errSubstr string // "" = no error expected
 	}{
-		{"unprotected, default policy", unprotected, "", false, ""},
-		{"unprotected vs root=verity", unprotected, "root=verity", false, "does not satisfy image policy"},
-		{"unprotected vs root=unprotected", unprotected, "root=unprotected", false, ""},
-		{"verity, default policy prefers verity", verity, "", true, ""},
-		{"verity vs root=verity", verity, "root=verity", true, ""},
-		{"verity vs root=unprotected mounts directly", verity, "root=unprotected", false, ""},
-		{"verity vs root=signed", verity, "root=signed", false, "does not satisfy image policy"},
-		{"verity vs root=absent", verity, "root=absent", false, "does not satisfy image policy"},
-		{"verity vs root=encrypted", verity, "root=encrypted", false, "not supported"},
-		{"signed treated as verity when verity allowed", signed, "root=verity+signed", true, ""},
-		{"signed-only policy unimplemented", signed, "root=signed", false, "signature verification not implemented"},
-		{"signed vs root=unprotected mounts directly", signed, "root=unprotected", false, ""},
-		{"signed vs root=absent", signed, "root=absent", false, "does not satisfy image policy"},
+		{"unprotected, default policy", unprotected, "", false, false, ""},
+		{"unprotected vs root=verity", unprotected, "root=verity", false, false, "does not satisfy image policy"},
+		{"unprotected vs root=unprotected", unprotected, "root=unprotected", false, false, ""},
+		{"verity, default policy prefers verity", verity, "", true, false, ""},
+		{"verity vs root=verity", verity, "root=verity", true, false, ""},
+		{"verity vs root=unprotected mounts directly", verity, "root=unprotected", false, false, ""},
+		{"verity vs root=signed", verity, "root=signed", false, false, "does not satisfy image policy"},
+		{"verity vs root=absent", verity, "root=absent", false, false, "does not satisfy image policy"},
+		{"verity vs root=encrypted", verity, "root=encrypted", false, false, "not supported"},
+		{"signed, default policy verifies signature", signed, "", true, true, ""},
+		{"signed vs root=verity+signed verifies signature", signed, "root=verity+signed", true, true, ""},
+		{"signed-only policy verifies signature", signed, "root=signed", true, true, ""},
+		{"signed vs root=verity treated as plain verity", signed, "root=verity", true, false, ""},
+		{"signed vs root=unprotected mounts directly", signed, "root=unprotected", false, false, ""},
+		{"signed vs root=absent", signed, "root=absent", false, false, "does not satisfy image policy"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -175,7 +178,7 @@ func TestDecideVerity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := decideVerity(tc.parts, g, "root", pol)
+			useVerity, checkSig, err := decideVerity(tc.parts, g, "root", pol)
 			if tc.errSubstr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.errSubstr) {
 					t.Fatalf("err = %v, want substring %q", err, tc.errSubstr)
@@ -185,8 +188,11 @@ func TestDecideVerity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tc.useVerity {
-				t.Errorf("useVerity = %v, want %v", got, tc.useVerity)
+			if useVerity != tc.useVerity {
+				t.Errorf("useVerity = %v, want %v", useVerity, tc.useVerity)
+			}
+			if checkSig != tc.checkSig {
+				t.Errorf("checkSig = %v, want %v", checkSig, tc.checkSig)
 			}
 		})
 	}
