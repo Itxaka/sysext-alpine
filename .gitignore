@@ -19,3 +19,7 @@ test/fixtures/*
 coverage*.out
 coverage.html
 .covdata/
+
+# Stray build binary (committed by accident once)
+/sysext
+/confext

@@ -35,6 +35,9 @@ package() {
 		"$pkgdir"/etc/init.d/sysext
 	install -Dm755 packaging/openrc/confext.initd \
 		"$pkgdir"/etc/init.d/confext
+
+	install -Dm644 LICENSE \
+		"$pkgdir"/usr/share/licenses/$pkgname/LICENSE
 }
 
 # Placeholder — regenerate with: abuild checksum

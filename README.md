@@ -52,7 +52,17 @@ confext unmerge
 ```
 
 Useful flags: `--json=short|pretty`, `--root=PATH`, `--force` (skip
-compatibility checks), `--noexec=false` (confext only).
+compatibility checks), `--noexec=false` (confext only),
+`--mutable=no|auto|yes|import|ephemeral|ephemeral-import` (writable
+hierarchies, see `docs/MUTABLE.md`), `--image-policy=POLICY`
+(systemd.image-policy(7) enforcement, see `docs/VERITY.md`).
+
+Defaults for `--mutable` and `--image-policy` can be set persistently in
+`/etc/systemd/sysext.conf` (confext: `confext.conf`) and drop-ins, with the
+same `[SysExt]`/`[ConfExt]` sections and search order as systemd's
+sysext.conf(5). Merge targets can be overridden with the
+`SYSTEMD_SYSEXT_HIERARCHIES` / `SYSTEMD_CONFEXT_HIERARCHIES` environment
+variables.
 
 ### Creating a squashfs sysext image
 
@@ -121,27 +131,42 @@ rc-update add confext default   # optional
   is checked against the kernel architecture unless `_any`.
 - Overlay mounts use the same flags as systemd: sysext `ro,nodev`, confext
   `ro,nodev,nosuid,noexec`.
-- `EXTENSION_RELOAD_MANAGER=1` is accepted but is a no-op on Alpine (logged
-  only) — there is no service manager to reload.
+- `EXTENSION_RELOAD_MANAGER=1` triggers `rc-update -u` after merge on OpenRC
+  systems (refreshing the service dependency cache so init scripts shipped
+  by extensions are picked up); suppressed with `--no-reload`.
+- `status`/`list` `--json` output is byte-compatible with systemd's.
+- `SYSEXT_SCOPE`/`CONFEXT_SCOPE` are enforced (must include `system`).
 
-## MVP scope / limitations
+## Verity and signed images
 
-Not implemented (tracked in `docs/SPEC.md` §7):
+GPT images carrying root/usr **verity** partitions are activated through
+dm-verity (pure-Go device-mapper ioctls, no udev needed), with the root hash
+discovered from the partition UUIDs per the Discoverable Partitions
+Specification. **Signed** images (verity-signature partitions, e.g. built
+with `systemd-repart -S --private-key=... --certificate=...`) are verified
+against PKCS#7 trust anchors in `/etc/verity.d/*.crt`, like systemd. Policy
+enforcement uses the full systemd.image-policy(7) grammar.
 
-- Verity, signatures, and image policies (verity/signature partitions in GPT
-  images are ignored)
-- Mutable modes (`--mutable=`)
-- initrd integration and `/.extra/sysext`
-- `EXTENSION_RELOAD_MANAGER` action
+See `docs/VERITY.md` for details and limitations, and `examples/` for a
+buildable signed-sysext example (`make example`) with public test keys.
+
+## Not implemented (deliberate)
+
+- initrd integration and `/.extra/sysext` (no systemd-stub flow on Alpine)
+- LUKS-encrypted partitions (the `encrypted` image-policy term never matches)
 - btrfs subvolume special-casing (plain directory handling covers it)
 
 ## Testing
 
 ```sh
-make test   # unit tests
-make e2e    # privileged end-to-end tests in an Alpine container (needs docker)
+make test       # unit tests
+make cover      # unit tests + coverage report
+make e2e        # privileged end-to-end suites in an Alpine container (docker)
+make e2e-cover  # e2e with a coverage-instrumented binary
 ```
 
-The e2e suite (`test/e2e/`) builds squashfs/ext4/erofs/GPT/directory test
-extensions inside a privileged `alpine:3.21` container and exercises the full
-merge/unmerge/refresh/masking lifecycle.
+The e2e suites (`test/e2e/inner*.sh`) run inside a privileged `alpine:3.21`
+container and cover: the full merge/unmerge/refresh/masking lifecycle for
+squashfs/ext4/erofs/GPT/directory extensions, all mutable modes, dm-verity
+incl. tamper detection, signed images (trusted/untrusted/expired/corrupted
+paths), config files, hierarchy overrides, locking, and scope enforcement.
