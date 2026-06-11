@@ -262,16 +262,26 @@ type mergeState struct {
 	mounted   []*image.Mounted // image mounts, in mount order
 	staged    []string         // overlay staging mounts not yet moved
 	moved     []string         // hierarchy targets already MS_MOVE'd
+	tmpfs     []string         // ephemeral tmpfs mounts (mutable modes)
+	workdirs  []string         // hidden overlayfs workdirs created (mutable)
 }
 
 // rollback undoes everything in reverse order. Errors are ignored: this is
-// best-effort cleanup on a failure path.
+// best-effort cleanup on a failure path. The ephemeral tmpfs mounts back the
+// overlay upperdirs, so they go after the overlays but before the image
+// mounts and workspace removal.
 func (s *mergeState) rollback() {
 	for i := len(s.moved) - 1; i >= 0; i-- {
 		_ = unmountWithRetry(s.moved[i])
 	}
 	for i := len(s.staged) - 1; i >= 0; i-- {
 		_ = unmountWithRetry(s.staged[i])
+	}
+	for i := len(s.tmpfs) - 1; i >= 0; i-- {
+		_ = unmountWithRetry(s.tmpfs[i])
+	}
+	for i := len(s.workdirs) - 1; i >= 0; i-- {
+		_ = os.RemoveAll(s.workdirs[i])
 	}
 	for i := len(s.mounted) - 1; i >= 0; i-- {
 		_ = s.mounted[i].Unmount()
@@ -292,6 +302,9 @@ func (s *mergeState) rollback() {
 // Fails (ErrAlreadyMerged) if any target hierarchy is already merged by us.
 // On error, everything mounted so far is rolled back.
 func Merge(class release.Class, images []discover.Image, opts MergeOptions) error {
+	if _, err := normalizeMutableMode(opts.Mutable); err != nil {
+		return err
+	}
 	for _, h := range Hierarchies(class) {
 		merged, err := IsMergedByUs(class, opts.Root, h)
 		if err != nil {
@@ -371,6 +384,18 @@ func mergeHierarchy(class release.Class, images []discover.Image, roots []string
 		}
 	}
 
+	// Mutability (--mutable=): may create routing dirs/workdirs and mount an
+	// ephemeral tmpfs; those are tracked in the merge state for rollback.
+	hm, err := resolveHierarchyMutability(opts.Mutable, opts.Root, hierarchy, ws)
+	if err != nil {
+		return fmt.Errorf("resolving mutability for %s: %w", hierarchy, err)
+	}
+	if hm.tmpfs != "" {
+		st.tmpfs = append(st.tmpfs, hm.tmpfs)
+	} else if hm.workDir != "" {
+		st.workdirs = append(st.workdirs, hm.workDir)
+	}
+
 	// Marker metadata (topmost lowerdir).
 	metaDir := filepath.Join(ws, "meta", esc)
 	markerDir := filepath.Join(metaDir, MarkerDirName(class))
@@ -383,20 +408,33 @@ func mergeHierarchy(class release.Class, images []discover.Image, roots []string
 	if err := writeMarker(markerDir, names, origins); err != nil {
 		return fmt.Errorf("writing marker for %s: %w", hierarchy, err)
 	}
-
-	// lowerdir = meta : newest..oldest extension : host (if present/non-empty)
-	lower := append([]string{metaDir}, extDirs...)
-	hostDir := filepath.Join(opts.Root, hierarchy)
-	if dirNonEmpty(hostDir) {
-		lower = append(lower, hostDir)
+	if hm.workDir != "" {
+		// Record the overlayfs workdir like systemd does, so unmerge can
+		// remove it even across process restarts.
+		if err := os.WriteFile(filepath.Join(markerDir, "work_dir"), []byte(hm.workDir+"\n"), 0o644); err != nil {
+			return fmt.Errorf("writing work_dir marker for %s: %w", hierarchy, err)
+		}
 	}
+
+	// lowerdir = meta : imported routing dir (import modes) :
+	// newest..oldest extension : host (if present/non-empty and not
+	// already serving as upperdir)
+	hostDir := filepath.Join(opts.Root, hierarchy)
+	if resolved, err := filepath.EvalSymlinks(hostDir); err == nil {
+		hostDir = resolved // canonical form, comparable with the resolved upperdir
+	}
+	lower := buildLowerPaths(metaDir, hm.importDir, extDirs, hostDir, dirNonEmpty(hostDir), hm.upperDir)
 
 	staging := filepath.Join(ws, "overlay", esc)
 	if err := os.MkdirAll(staging, 0o755); err != nil {
 		return fmt.Errorf("creating staging dir %s: %w", staging, err)
 	}
 	flags := overlayMountFlags(class, opts.NoExec)
-	data := "lowerdir=" + buildLowerdir(lower)
+	if hm.upperDir != "" {
+		flags &^= unix.MS_RDONLY  // mutable overlay must be writable
+		flags |= unix.MS_NOATIME  // systemd's "noatime" mutable mount option
+	}
+	data := buildOverlayData(lower, hm.upperDir, hm.workDir)
 	if err := unix.Mount("overlay", staging, "overlay", flags, data); err != nil {
 		return fmt.Errorf("mounting overlay for %s (%s): %w", hierarchy, data, err)
 	}
@@ -545,6 +583,11 @@ func Unmerge(class release.Class, root string) error {
 		}
 	}
 
+	// Mutable-mode residue: ephemeral tmpfs mounts and recorded workdirs.
+	// Must run after the overlays are unmounted (tmpfs backs their upperdir)
+	// and before the workspace (holding the work_dir markers) is removed.
+	cleanupMutableLeftovers(class, ws)
+
 	// Backing-file paths must be collected before the workspace is removed.
 	rawPaths := collectRawOriginPaths(class, ws)
 
@@ -555,8 +598,13 @@ func Unmerge(class release.Class, root string) error {
 		}
 	}
 
-	// Detach any loop devices still backed by raw image files.
+	// Tear down dm-verity devices before their backing loop devices: the dm
+	// table holds the loop partitions open, so the order matters. Then
+	// detach any loop devices still backed by raw image files.
 	for _, p := range rawPaths {
+		if err := image.RemoveVerityFor(p); err != nil {
+			errs = append(errs, fmt.Errorf("removing verity device for %s: %w", p, err))
+		}
 		if err := image.DetachAllLoopsFor(p); err != nil {
 			errs = append(errs, fmt.Errorf("detaching loops for %s: %w", p, err))
 		}

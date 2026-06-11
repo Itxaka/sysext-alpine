@@ -326,6 +326,363 @@ func TestUnmergeIdempotentOnUnmergedRoot(t *testing.T) {
 	}
 }
 
+func TestNormalizeMutableMode(t *testing.T) {
+	valid := map[string]string{
+		"":                 "no",
+		"no":               "no",
+		"auto":             "auto",
+		"yes":              "yes",
+		"import":           "import",
+		"ephemeral":        "ephemeral",
+		"ephemeral-import": "ephemeral-import",
+	}
+	for in, want := range valid {
+		got, err := normalizeMutableMode(in)
+		if err != nil || got != want {
+			t.Errorf("normalizeMutableMode(%q) = %q, %v; want %q, nil", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"bogus", "enabled", "disabled", "NO", "Yes", "ephemeral_import", "help"} {
+		if _, err := normalizeMutableMode(in); err == nil {
+			t.Errorf("normalizeMutableMode(%q) should error", in)
+		}
+	}
+}
+
+func TestMutableModePredicates(t *testing.T) {
+	cases := []struct {
+		mode      string
+		ephemeral bool
+		imports   bool
+	}{
+		{"no", false, false},
+		{"auto", false, false},
+		{"yes", false, false},
+		{"import", false, true},
+		{"ephemeral", true, false},
+		{"ephemeral-import", true, true},
+	}
+	for _, c := range cases {
+		if got := modeUsesEphemeralUpper(c.mode); got != c.ephemeral {
+			t.Errorf("modeUsesEphemeralUpper(%q) = %v, want %v", c.mode, got, c.ephemeral)
+		}
+		if got := modeImportsRouting(c.mode); got != c.imports {
+			t.Errorf("modeImportsRouting(%q) = %v, want %v", c.mode, got, c.imports)
+		}
+	}
+}
+
+func TestRoutingDir(t *testing.T) {
+	cases := []struct {
+		root, hierarchy, want string
+	}{
+		{"", "/usr", "/var/lib/extensions.mutable/usr"},
+		{"", "/opt", "/var/lib/extensions.mutable/opt"},
+		{"", "/etc", "/var/lib/extensions.mutable/etc"},
+		{"/alt", "/usr", "/alt/var/lib/extensions.mutable/usr"},
+	}
+	for _, c := range cases {
+		if got := routingDir(c.root, c.hierarchy); got != c.want {
+			t.Errorf("routingDir(%q, %q) = %q, want %q", c.root, c.hierarchy, got, c.want)
+		}
+	}
+}
+
+func TestWorkDirForUpper(t *testing.T) {
+	cases := []struct {
+		hierarchy, upper, want string
+	}{
+		// plain routing dir → hidden sibling inside the routing base
+		{"/usr", "/var/lib/extensions.mutable/usr", "/var/lib/extensions.mutable/.usr-workdir"},
+		{"/etc", "/var/lib/extensions.mutable/etc", "/var/lib/extensions.mutable/.etc-workdir"},
+		// routing symlink resolved to the host hierarchy → sibling of target
+		{"/usr", "/usr", "/.usr-workdir"},
+		{"/opt", "/data/opt-writes", "/data/.opt-workdir"},
+	}
+	for _, c := range cases {
+		if got := workDirForUpper(c.hierarchy, c.upper); got != c.want {
+			t.Errorf("workDirForUpper(%q, %q) = %q, want %q", c.hierarchy, c.upper, got, c.want)
+		}
+	}
+}
+
+func TestBuildOverlayData(t *testing.T) {
+	// read-only: lowerdir only, no mutable options
+	got := buildOverlayData([]string{"/meta", "/ext", "/usr"}, "", "")
+	if got != "lowerdir=/meta:/ext:/usr" {
+		t.Errorf("read-only data = %q", got)
+	}
+	// mutable: upperdir + workdir + systemd's mutable mount options
+	got = buildOverlayData([]string{"/meta", "/usr"},
+		"/var/lib/extensions.mutable/usr", "/var/lib/extensions.mutable/.usr-workdir")
+	want := "lowerdir=/meta:/usr" +
+		",upperdir=/var/lib/extensions.mutable/usr" +
+		",workdir=/var/lib/extensions.mutable/.usr-workdir" +
+		",redirect_dir=on,metacopy=off,index=off"
+	if got != want {
+		t.Errorf("mutable data = %q, want %q", got, want)
+	}
+	// upper/work paths get overlayfs option escaping
+	got = buildOverlayData([]string{"/meta"}, "/up,per", "/work:dir")
+	if got != `lowerdir=/meta,upperdir=/up\,per,workdir=/work\:dir,redirect_dir=on,metacopy=off,index=off` {
+		t.Errorf("escaped mutable data = %q", got)
+	}
+}
+
+func TestHostLowerExcluded(t *testing.T) {
+	cases := []struct {
+		host, upper, importDir string
+		want                   bool
+	}{
+		{"/usr", "", "", false},
+		{"/usr", "/var/lib/extensions.mutable/usr", "", false},
+		// upperdir IS the host hierarchy (routing symlink → /usr)
+		{"/usr", "/usr", "", true},
+		{"/usr", "/usr/", "", true}, // path cleaning
+		// imported routing dir is the host itself
+		{"/usr", "", "/usr", true},
+		{"/etc", "/var/lib/extensions.mutable/etc", "/var/lib/extensions.mutable/etc", false},
+	}
+	for _, c := range cases {
+		if got := hostLowerExcluded(c.host, c.upper, c.importDir); got != c.want {
+			t.Errorf("hostLowerExcluded(%q, %q, %q) = %v, want %v", c.host, c.upper, c.importDir, got, c.want)
+		}
+	}
+}
+
+func TestBuildLowerPaths(t *testing.T) {
+	meta := "/run/systemd/sysext/meta/usr"
+	exts := []string{"/ws/ext/b/usr", "/ws/ext/a/usr"}
+
+	// default read-only: meta : exts : host
+	got := buildLowerPaths(meta, "", exts, "/usr", true, "")
+	if !reflect.DeepEqual(got, []string{meta, "/ws/ext/b/usr", "/ws/ext/a/usr", "/usr"}) {
+		t.Errorf("read-only lower = %v", got)
+	}
+
+	// import: routing dir directly below meta, host still at the bottom
+	got = buildLowerPaths(meta, "/var/lib/extensions.mutable/usr", exts, "/usr", true, "")
+	if !reflect.DeepEqual(got, []string{meta, "/var/lib/extensions.mutable/usr", "/ws/ext/b/usr", "/ws/ext/a/usr", "/usr"}) {
+		t.Errorf("import lower = %v", got)
+	}
+
+	// missing/empty host omitted
+	got = buildLowerPaths(meta, "", exts, "/opt", false, "")
+	if !reflect.DeepEqual(got, []string{meta, "/ws/ext/b/usr", "/ws/ext/a/usr"}) {
+		t.Errorf("no-host lower = %v", got)
+	}
+
+	// host serving as upperdir is excluded from lowerdir
+	got = buildLowerPaths(meta, "", exts, "/usr", true, "/usr")
+	if !reflect.DeepEqual(got, []string{meta, "/ws/ext/b/usr", "/ws/ext/a/usr"}) {
+		t.Errorf("upper==host lower = %v", got)
+	}
+
+	// mutable upper elsewhere keeps host at the bottom
+	got = buildLowerPaths(meta, "", exts, "/usr", true, "/var/lib/extensions.mutable/usr")
+	if !reflect.DeepEqual(got, []string{meta, "/ws/ext/b/usr", "/ws/ext/a/usr", "/usr"}) {
+		t.Errorf("mutable lower = %v", got)
+	}
+}
+
+func TestResolveHierarchyMutability(t *testing.T) {
+	newRoot := func(t *testing.T) (root, ws string) {
+		t.Helper()
+		root = t.TempDir()
+		return root, Workspace(release.Sysext, root)
+	}
+
+	t.Run("invalid mode", func(t *testing.T) {
+		root, ws := newRoot(t)
+		if _, err := resolveHierarchyMutability("bogus", root, "/usr", ws); err == nil {
+			t.Fatal("expected error for invalid mode")
+		}
+	})
+
+	t.Run("no is inert even with routing dir", func(t *testing.T) {
+		root, ws := newRoot(t)
+		if err := os.MkdirAll(routingDir(root, "/usr"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, mode := range []string{"", "no"} {
+			hm, err := resolveHierarchyMutability(mode, root, "/usr", ws)
+			if err != nil {
+				t.Fatalf("mode %q: %v", mode, err)
+			}
+			if hm != (hierMutable{}) {
+				t.Errorf("mode %q: expected zero config, got %+v", mode, hm)
+			}
+		}
+	})
+
+	t.Run("auto without routing dir stays read-only", func(t *testing.T) {
+		root, ws := newRoot(t)
+		hm, err := resolveHierarchyMutability("auto", root, "/usr", ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hm != (hierMutable{}) {
+			t.Errorf("expected zero config, got %+v", hm)
+		}
+		if _, err := os.Stat(routingDir(root, "/usr")); !errors.Is(err, os.ErrNotExist) {
+			t.Error("auto must not create the routing dir")
+		}
+	})
+
+	t.Run("auto with routing dir is mutable", func(t *testing.T) {
+		root, ws := newRoot(t)
+		routing := routingDir(root, "/usr")
+		if err := os.MkdirAll(routing, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		hm, err := resolveHierarchyMutability("auto", root, "/usr", ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// EvalSymlinks may canonicalize the tempdir prefix; compare via samefile.
+		fiGot, err := os.Stat(hm.upperDir)
+		if err != nil {
+			t.Fatalf("stat upperDir %q: %v", hm.upperDir, err)
+		}
+		fiWant, _ := os.Stat(routing)
+		if !os.SameFile(fiGot, fiWant) {
+			t.Errorf("upperDir = %q, want %q", hm.upperDir, routing)
+		}
+		if filepath.Base(hm.workDir) != ".usr-workdir" || filepath.Dir(hm.workDir) != filepath.Dir(hm.upperDir) {
+			t.Errorf("workDir = %q, want hidden sibling of %q", hm.workDir, hm.upperDir)
+		}
+		if fi, err := os.Stat(hm.workDir); err != nil || !fi.IsDir() {
+			t.Errorf("workdir not created: %v", err)
+		}
+		if hm.importDir != "" || hm.tmpfs != "" {
+			t.Errorf("unexpected import/tmpfs: %+v", hm)
+		}
+	})
+
+	t.Run("auto with routing symlink routes to target", func(t *testing.T) {
+		root, ws := newRoot(t)
+		target := filepath.Join(root, "usr")
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(routingDir(root, "/usr")), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, routingDir(root, "/usr")); err != nil {
+			t.Fatal(err)
+		}
+		hm, err := resolveHierarchyMutability("auto", root, "/usr", ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fiGot, err := os.Stat(hm.upperDir)
+		if err != nil {
+			t.Fatalf("stat upperDir: %v", err)
+		}
+		fiWant, _ := os.Stat(target)
+		if !os.SameFile(fiGot, fiWant) {
+			t.Errorf("upperDir = %q, want symlink target %q", hm.upperDir, target)
+		}
+		// workdir is a hidden sibling of the *target*, sharing its filesystem
+		if filepath.Dir(hm.workDir) != filepath.Dir(hm.upperDir) {
+			t.Errorf("workDir %q not a sibling of resolved upper %q", hm.workDir, hm.upperDir)
+		}
+	})
+
+	t.Run("yes creates routing dir", func(t *testing.T) {
+		root, ws := newRoot(t)
+		hm, err := resolveHierarchyMutability("yes", root, "/opt", ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routing := routingDir(root, "/opt")
+		if fi, err := os.Stat(routing); err != nil || !fi.IsDir() {
+			t.Fatalf("routing dir not created: %v", err)
+		}
+		if hm.upperDir == "" || hm.workDir == "" {
+			t.Errorf("yes must be mutable: %+v", hm)
+		}
+	})
+
+	t.Run("yes fails when routing dir cannot be created", func(t *testing.T) {
+		root, ws := newRoot(t)
+		// occupy the routing base path with a regular file → MkdirAll fails
+		if err := os.MkdirAll(filepath.Join(root, "var/lib"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "var/lib/extensions.mutable"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolveHierarchyMutability("yes", root, "/usr", ws); err == nil {
+			t.Fatal("expected error when routing dir cannot be created")
+		}
+	})
+
+	t.Run("import is read-only with routing dir as importDir", func(t *testing.T) {
+		root, ws := newRoot(t)
+		routing := routingDir(root, "/usr")
+		if err := os.MkdirAll(routing, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		hm, err := resolveHierarchyMutability("import", root, "/usr", ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hm.upperDir != "" || hm.workDir != "" || hm.tmpfs != "" {
+			t.Errorf("import must stay read-only: %+v", hm)
+		}
+		fiGot, err := os.Stat(hm.importDir)
+		if err != nil {
+			t.Fatalf("stat importDir: %v", err)
+		}
+		fiWant, _ := os.Stat(routing)
+		if !os.SameFile(fiGot, fiWant) {
+			t.Errorf("importDir = %q, want %q", hm.importDir, routing)
+		}
+	})
+
+	t.Run("import without routing dir imports nothing", func(t *testing.T) {
+		root, ws := newRoot(t)
+		hm, err := resolveHierarchyMutability("import", root, "/usr", ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hm != (hierMutable{}) {
+			t.Errorf("expected zero config, got %+v", hm)
+		}
+	})
+}
+
+func TestSafeWorkDirPath(t *testing.T) {
+	ws := "/run/systemd/sysext"
+	cases := []struct {
+		p    string
+		want bool
+	}{
+		{"/var/lib/extensions.mutable/.usr-workdir", true},
+		{"/.usr-workdir", true},
+		{"/run/systemd/sysext/mh_workspace/usr/work", true},
+		{"", false},
+		{"relative/.usr-workdir", false},
+		{"/", false},
+		{"/usr", false},
+		{"/run/systemd/sysext/mh_workspace", false}, // the dir itself, not inside it
+	}
+	for _, c := range cases {
+		if got := safeWorkDirPath(c.p, ws); got != c.want {
+			t.Errorf("safeWorkDirPath(%q) = %v, want %v", c.p, got, c.want)
+		}
+	}
+}
+
+func TestMergeInvalidMutableMode(t *testing.T) {
+	root := t.TempDir()
+	err := Merge(release.Sysext, nil, MergeOptions{Root: root, Mutable: "bogus"})
+	if err == nil {
+		t.Fatal("Merge with invalid --mutable mode must fail")
+	}
+}
+
 func TestDirNonEmpty(t *testing.T) {
 	dir := t.TempDir()
 	empty := filepath.Join(dir, "empty")

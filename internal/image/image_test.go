@@ -179,6 +179,13 @@ func TestParseGPT(t *testing.T) {
 				t.Errorf("part 0 LBAs = %d..%d, want 2048..4095",
 					parts[0].FirstLBA, parts[0].LastLBA)
 			}
+			// buildGPT plants byte(i+1) as the first on-disk byte of the
+			// unique GUID; that byte is the LSB of the LE first group.
+			if parts[0].UniqueGUID != "00000001-0000-0000-0000-000000000000" ||
+				parts[1].UniqueGUID != "00000002-0000-0000-0000-000000000000" {
+				t.Errorf("unique GUIDs = %q, %q",
+					parts[0].UniqueGUID, parts[1].UniqueGUID)
+			}
 		})
 	}
 }
@@ -287,23 +294,45 @@ func TestSelectPartition(t *testing.T) {
 }
 
 func TestArchGUIDMapping(t *testing.T) {
-	want := map[string][2]string{
-		"x86-64":  {"4f68bce3-e8cd-4db1-96e7-fbcaf984b709", "8484680c-9521-48c6-9c11-b0720656f69e"},
-		"arm64":   {"b921b045-1df0-41c3-af44-4c6f280d3fae", "b0e01050-ee5f-4390-949a-9101b17104e9"},
-		"riscv64": {"72ec70a6-cf74-40e6-bd49-4bda08e8f224", "beaec34b-8442-439b-a40b-984381ed097d"},
+	// Per the UAPI Discoverable Partitions Specification:
+	// root, root-verity, root-verity-sig, usr, usr-verity, usr-verity-sig.
+	want := map[string]dpsGUIDs{
+		"x86-64": {
+			root:          "4f68bce3-e8cd-4db1-96e7-fbcaf984b709",
+			rootVerity:    "2c7357ed-ebd2-46d9-aec1-23d437ec2bf5",
+			rootVeritySig: "41092b05-9fc8-4523-994f-2def0408b176",
+			usr:           "8484680c-9521-48c6-9c11-b0720656f69e",
+			usrVerity:     "77ff5f63-e7b6-4633-acf4-1565b864c0e6",
+			usrVeritySig:  "e7bb33fb-06cf-4e81-8273-e543b413e2e2",
+		},
+		"arm64": {
+			root:          "b921b045-1df0-41c3-af44-4c6f280d3fae",
+			rootVerity:    "df3300ce-d69f-4c92-978c-9bfb0f38d820",
+			rootVeritySig: "6db69de6-29f4-4758-a7a5-962190f00ce3",
+			usr:           "b0e01050-ee5f-4390-949a-9101b17104e9",
+			usrVerity:     "6e11a4e7-fbca-4ded-b9e9-e1a512bb664e",
+			usrVeritySig:  "c23ce4ff-44bd-4b00-b2d4-b41b3419e02a",
+		},
+		"riscv64": {
+			root:          "72ec70a6-cf74-40e6-bd49-4bda08e8f224",
+			rootVerity:    "b6ed5582-440b-4209-b8da-5ff7c419ea3d",
+			rootVeritySig: "efe0f087-ea8d-4469-821a-4c2a96a8386a",
+			usr:           "beaec34b-8442-439b-a40b-984381ed097d",
+			usrVerity:     "8f1056be-9b05-47c4-81d6-be53128e5b54",
+			usrVeritySig:  "d2f9000a-7a18-453f-b5cd-4d32f77a7b32",
+		},
 	}
 	if len(archGUIDs) != len(want) {
 		t.Errorf("archGUIDs has %d entries, want %d", len(archGUIDs), len(want))
 	}
-	for arch, pair := range want {
+	for arch, w := range want {
 		got, ok := archGUIDs[arch]
 		if !ok {
 			t.Errorf("missing arch %q", arch)
 			continue
 		}
-		if got.root != pair[0] || got.usr != pair[1] {
-			t.Errorf("%s = {root:%s usr:%s}, want {root:%s usr:%s}",
-				arch, got.root, got.usr, pair[0], pair[1])
+		if got != w {
+			t.Errorf("%s = %+v, want %+v", arch, got, w)
 		}
 	}
 }
