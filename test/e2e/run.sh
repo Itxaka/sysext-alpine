@@ -15,7 +15,10 @@ if [ ! -x "$REPO/bin/sysext" ]; then
     exit 1
 fi
 
+# Host kernel modules are mounted read-only so the (privileged) container can
+# modprobe squashfs/erofs/etc. for the host kernel.
 exec "$DOCKER" run --privileged --rm \
     -v "$REPO:/work" \
+    -v /lib/modules:/lib/modules:ro \
     "$IMAGE" \
     /bin/sh /work/test/e2e/inner.sh

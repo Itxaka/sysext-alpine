@@ -20,9 +20,14 @@ const (
 	loopAttachRetries = 10
 )
 
-// loopAttach attaches path to a free loop device read-only (with autoclear,
-// and partition scanning when partscan is true) and returns the device path
+// loopAttach attaches path to a free loop device read-only (with partition
+// scanning when partscan is true) and returns the device path
 // (e.g. /dev/loop3).
+//
+// LO_FLAGS_AUTOCLEAR is deliberately NOT set: the configuring fd is closed
+// before the device is mounted, and with autoclear that close would drop the
+// last reference and detach the device again. Detaching is explicit via
+// loopDetach (LOOP_CLR_FD) instead.
 func loopAttach(path string, partscan bool) (string, error) {
 	backing, err := os.OpenFile(path, os.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -36,7 +41,7 @@ func loopAttach(path string, partscan bool) (string, error) {
 	}
 	defer ctl.Close()
 
-	flags := uint32(unix.LO_FLAGS_READ_ONLY | unix.LO_FLAGS_AUTOCLEAR)
+	flags := uint32(unix.LO_FLAGS_READ_ONLY)
 	if partscan {
 		flags |= unix.LO_FLAGS_PARTSCAN
 	}
@@ -138,13 +143,12 @@ func ensureLoopNode(devPath string, num int) error {
 // partition scan to publish the sysfs entry.
 func ensurePartitionNode(loopDev string, index int) (string, error) {
 	partDev := fmt.Sprintf("%sp%d", loopDev, index)
-	if _, err := os.Stat(partDev); err == nil {
-		return partDev, nil
-	}
-
 	loopName := filepath.Base(loopDev)
 	sysDev := fmt.Sprintf("/sys/block/%s/%sp%d/dev", loopName, loopName, index)
 
+	// sysfs is authoritative for the partition's dev_t. An existing /dev
+	// node cannot be trusted: without udev nothing removes nodes from prior
+	// attach cycles, and a stale node's dev_t yields ENXIO on open.
 	var data []byte
 	var err error
 	for i := 0; i < 100; i++ { // up to ~1s for partscan to settle
@@ -162,7 +166,25 @@ func ensurePartitionNode(loopDev string, index int) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parsing %s: %w", sysDev, err)
 	}
-	if err := unix.Mknod(partDev, unix.S_IFBLK|0o660, int(unix.Mkdev(major, minor))); err != nil && !errors.Is(err, unix.EEXIST) {
+	want := unix.Mkdev(major, minor)
+
+	var st unix.Stat_t
+	switch err := unix.Stat(partDev, &st); {
+	case err == nil:
+		if st.Mode&unix.S_IFMT == unix.S_IFBLK && st.Rdev == want {
+			return partDev, nil // existing node is correct
+		}
+		// Stale or wrong node: replace it.
+		if err := os.Remove(partDev); err != nil {
+			return "", fmt.Errorf("removing stale node %s: %w", partDev, err)
+		}
+	case errors.Is(err, unix.ENOENT):
+		// no node yet
+	default:
+		return "", fmt.Errorf("stat %s: %w", partDev, err)
+	}
+
+	if err := unix.Mknod(partDev, unix.S_IFBLK|0o660, int(want)); err != nil && !errors.Is(err, unix.EEXIST) {
 		return "", fmt.Errorf("mknod %s: %w", partDev, err)
 	}
 	return partDev, nil

@@ -4,9 +4,10 @@
 # exercises merge/unmerge/refresh/status/list and masking, and reports
 # PASS/FAIL/SKIP per step. Exits non-zero if any step FAILed.
 #
-# NOTE: the container shares the host kernel and cannot modprobe. If a
-# filesystem (squashfs/erofs/ext4/overlay) is not already available in the
-# host kernel, the affected image type is SKIPped, not failed.
+# NOTE: the container shares the host kernel. run.sh bind-mounts the host's
+# /lib/modules read-only so missing filesystems (squashfs/erofs/...) can be
+# modprobe'd from inside the privileged container. If a filesystem still
+# cannot be made available, the affected image type is SKIPped, not failed.
 set -u
 
 FAILS=0
@@ -16,10 +17,11 @@ pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 skip() { echo "SKIP: $*"; SKIPS=$((SKIPS + 1)); }
 
-# A filesystem is usable if it is already registered with the kernel.
-# We cannot modprobe inside the container (no /lib/modules for the host
-# kernel), so /proc/filesystems is the source of truth.
+# A filesystem is usable if it is registered with the kernel, or can be
+# loaded via modprobe (host /lib/modules is bind-mounted by run.sh).
 fs_supported() {
+    grep -qw "$1" /proc/filesystems && return 0
+    modprobe "$1" 2>/dev/null || true
     grep -qw "$1" /proc/filesystems
 }
 
@@ -27,8 +29,8 @@ fs_supported() {
 # Environment setup
 # ---------------------------------------------------------------------------
 echo "=== Installing build dependencies ==="
-apk add --no-cache squashfs-tools e2fsprogs erofs-utils util-linux sgdisk \
-    || apk add --no-cache squashfs-tools e2fsprogs erofs-utils util-linux \
+apk add --no-cache squashfs-tools e2fsprogs erofs-utils util-linux kmod sgdisk \
+    || apk add --no-cache squashfs-tools e2fsprogs erofs-utils util-linux kmod \
     || { echo "FATAL: apk add failed"; exit 1; }
 
 if [ ! -x /work/bin/sysext ]; then
