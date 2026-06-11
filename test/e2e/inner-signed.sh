@@ -355,26 +355,72 @@ rm -f "$UNSIGNED"
 
 # ---------------------------------------------------------------------------
 # (f) optional real-fixture compat test: drop a systemd-built signed DDI as
-#     /work/test/fixtures/signed-*.raw plus its certificate as
-#     /work/test/fixtures/*.crt to validate interoperability.
+#     /work/test/fixtures/signed-*.raw plus its signer certificate as
+#     /work/test/fixtures/*.crt or *.pem (e.g. systemd-repart
+#     --certificate=db.pem output) to validate interoperability.
+#
+#     Branches on certificate validity: a fixture signed with an expired
+#     certificate must be REJECTED under root=signed (proving expiry is
+#     honored, like systemd/openssl) and must DEGRADE to plain verity under
+#     root=signed+verity. A fixture with a valid certificate must merge
+#     under root=signed directly.
 # ---------------------------------------------------------------------------
 FIXTURE_IMG=$(ls /work/test/fixtures/signed-*.raw 2>/dev/null | head -n1)
-FIXTURE_CRT=$(ls /work/test/fixtures/*.crt 2>/dev/null | head -n1)
+# Prefer db.pem (systemd-repart --certificate= convention), then *.crt,
+# then any other *.pem.
+if [ -f /work/test/fixtures/db.pem ]; then
+    FIXTURE_CRT=/work/test/fixtures/db.pem
+else
+    FIXTURE_CRT=$(ls /work/test/fixtures/*.crt \
+        /work/test/fixtures/*.pem 2>/dev/null | head -n1)
+fi
 if [ -n "${FIXTURE_IMG:-}" ] && [ -n "${FIXTURE_CRT:-}" ]; then
-    echo "=== Real signed fixture: $FIXTURE_IMG ==="
+    echo "=== Real signed fixture: $FIXTURE_IMG (cert: $FIXTURE_CRT) ==="
     rm -f /etc/verity.d/*.crt /var/lib/extensions/*.raw
     cp "$FIXTURE_CRT" /etc/verity.d/fixture.crt
     cp "$FIXTURE_IMG" "/var/lib/extensions/$(basename "$FIXTURE_IMG")"
-    # --force only skips the version/host match, not signature verification.
-    if out=$(sysext --image-policy=root=signed --force merge 2>&1); then
-        pass "real signed fixture merged with root=signed"
-        sysext unmerge || fail "unmerge after fixture merge"
+    # --force skips the host/version (and release-file) validation: CI
+    # signing fixtures may carry no extension-release payload. Signature
+    # verification is never skipped.
+    if openssl x509 -checkend 0 -noout -in "$FIXTURE_CRT" >/dev/null 2>&1; then
+        # Valid certificate: signed-only policy must succeed.
+        if out=$(sysext --image-policy=root=signed --force merge 2>&1); then
+            pass "real signed fixture merged with root=signed"
+            sysext unmerge || fail "unmerge after fixture merge"
+        else
+            fail "real signed fixture rejected: $out"
+        fi
     else
-        fail "real signed fixture rejected: $out"
+        echo "(fixture certificate is expired — testing rejection + degradation)"
+        # Expired certificate: signed-only policy must reject ...
+        if sysext --image-policy=root=signed --force merge 2>/dev/null; then
+            fail "expired-cert fixture accepted under root=signed"
+            sysext unmerge >/dev/null 2>&1 || true
+        else
+            pass "expired-cert fixture rejected under root=signed"
+        fi
+        # ... and signed+verity must degrade to plain verity with a warning.
+        if out=$(sysext "--image-policy=root=signed+verity" --force merge 2>&1); then
+            pass "expired-cert fixture degraded to verity under root=signed+verity"
+            case $out in
+                *[Ww]arning*) pass "degradation warning emitted" ;;
+                *) fail "no degradation warning in output: $out" ;;
+            esac
+            # dm-verity must actually be active for the fixture.
+            base=$(basename "$FIXTURE_IMG" .raw)
+            if [ -e "/dev/mapper/sysext-$base-verity" ]; then
+                pass "dm-verity active for real fixture"
+            else
+                fail "no dm-verity device for real fixture"
+            fi
+            sysext unmerge || fail "unmerge after degraded fixture merge"
+        else
+            fail "expired-cert fixture did not degrade under root=signed+verity: $out"
+        fi
     fi
     rm -f "/var/lib/extensions/$(basename "$FIXTURE_IMG")"
 else
-    skip "no real signed fixture (drop signed-*.raw + *.crt into test/fixtures to enable)"
+    skip "no real signed fixture (drop signed-*.raw + *.crt/*.pem into test/fixtures to enable)"
 fi
 
 # Final cleanup so the container exits with nothing mounted.

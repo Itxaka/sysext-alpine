@@ -8,3 +8,8 @@ bin/
 *.test
 *.out
 coverage.html
+
+# Local test fixtures (real signed images, certificates, PRIVATE KEYS —
+# never commit; see test/fixtures/README.md)
+test/fixtures/*
+!test/fixtures/README.md
