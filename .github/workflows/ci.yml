@@ -153,6 +153,7 @@ jobs:
           name: covdata-e2e-${{ strategy.job-index }}
           path: .covdata
           if-no-files-found: error
+          include-hidden-files: true
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
@@ -181,6 +182,7 @@ jobs:
           name: covdata-differential
           path: .covdata
           if-no-files-found: error
+          include-hidden-files: true
       - uses: actions/upload-artifact@v7
         if: always()
         with:

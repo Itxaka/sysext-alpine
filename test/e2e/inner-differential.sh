@@ -92,6 +92,14 @@ stale/unmerge over stale metadata|systemd cannot parse the shadowed dev marker a
 env/state after a failed merge|systemd loses the submounts of /usr (the /lib/modules volume) when the overlay mount fails; this implementation keeps them
 '
 
+# ALLOWED entries where systemd's result depends on the readdir order of
+# the file system (and kernel) under the test: matching systemd 262 on one
+# runner is no reason to drop them.
+READDIR_ORDER='
+precedence/directory and raw image of the same name
+precedence/merge with a directory and a raw image of the same name
+'
+
 allowed() {
     echo "$ALLOWED" | awk -F'|' -v k="$1" '$1 == k {print $2; exit}'
 }
@@ -356,7 +364,9 @@ compare() {
         key="$1/${st#\#\#\# }"
         reason=$(allowed "$key")
         if [ -f "$sd/$f" ] && [ -f "$go/$f" ] && cmp -s "$sd/$f" "$go/$f"; then
-            if [ -n "$reason" ]; then
+            if [ -n "$reason" ] && echo "$READDIR_ORDER" | grep -qxF "$key"; then
+                pass "$key: identical to systemd 262 on this file system"
+            elif [ -n "$reason" ]; then
                 fail "$key: identical to systemd 262, drop its ALLOWED entry"
             else
                 pass "$key"
