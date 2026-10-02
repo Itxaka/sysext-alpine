@@ -12,12 +12,14 @@ the interop part when the image hasn't been built).
 > anything real with them.**
 
 The image itself is not committed — build it with `make example` (needs
-`openssl` and `systemd-repart`, runs unprivileged).
+`openssl` and `systemd-repart`, runs unprivileged). The build is
+reproducible and targets the build host's architecture unless `ARCH=` names
+another one (`ARCH=arm64 make example`).
 
 ## Try it
 
 ```sh
-make build-static
+make build
 sudo install -m0755 bin/sysext /usr/bin/sysext
 
 sudo mkdir -p /var/lib/extensions /etc/verity.d

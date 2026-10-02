@@ -1,410 +1,625 @@
-// Package image provides access to extension image content: plain
-// directories and raw disk images (bare-filesystem or GPT-partitioned),
-// per docs/SPEC.md §3.
+// Package image makes extension images accessible: plain directories and
+// raw disk images, either a single filesystem or a partitioned DDI per the
+// UAPI Discoverable Partitions Specification, dissected like systemd v262
+// (src/shared/dissect-image.c) with the flags systemd-sysext uses.
 //
-// Raw images are attached to a loop device (LOOP_CTL_GET_FREE +
-// LOOP_CONFIGURE, read-only, partition scanning enabled for GPT) and
-// mounted read-only at the supplied mount point.
+// Raw images are attached read-only to loop devices with
+// LO_FLAGS_AUTOCLEAR, dm-verity devices are marked for deferred removal once
+// mounted, so unmounting the image releases everything.
 package image
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"strings"
+	"slices"
+	"strconv"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/itxaka/sysext-alpine/internal/discover"
+	"github.com/itxaka/sysext-alpine/internal/errno"
+	"github.com/itxaka/sysext-alpine/internal/fsutil"
+	"github.com/itxaka/sysext-alpine/internal/release"
 )
-
-// FSType is a detected filesystem or container format.
-type FSType string
-
-const (
-	FSSquashfs FSType = "squashfs"
-	FSErofs    FSType = "erofs"
-	FSExt4     FSType = "ext4"
-	FSGPT      FSType = "gpt" // GPT-partitioned DDI
-	FSUnknown  FSType = "unknown"
-)
-
-// Mounted is an attached image whose root tree is accessible at Root.
-type Mounted struct {
-	// Root is the directory exposing the image's filesystem tree
-	// (for TypeDirectory images this is the image path itself).
-	Root string
-	// LoopDevice is the backing loop device path ("" for directories).
-	LoopDevice string
-	// Partition is the mounted partition device for GPT images ("" otherwise).
-	Partition string
-	// VerityDevice is the dm-verity device path (/dev/mapper/<name>) the
-	// filesystem was mounted from, "" when no verity protection is active.
-	VerityDevice string
-	// FS is the detected payload filesystem.
-	FS FSType
-
-	// verityName is the device-mapper device name behind VerityDevice;
-	// Unmount removes it after unmounting.
-	verityName string
-	// mountTarget is the directory we actually mounted on (Root, or
-	// Root/usr for usr-only GPT images). Empty for directory images.
-	mountTarget string
-}
-
-// Detect probes the file at path and returns the format: checks GPT header
-// ("EFI PART" at LBA 1 for 512 and 4096 byte sectors), squashfs magic
-// ("hsqs" at 0), erofs magic (0xE0F5E1E2 LE at 1024), ext4 magic
-// (0xEF53 LE at 1080).
-func Detect(path string) (FSType, error) {
-	return detectPath(path)
-}
 
 // MountOpts tunes MountWithOpts.
 type MountOpts struct {
 	// Arch is the host architecture in systemd notation ("x86-64", ...);
-	// selects the GPT partition type GUIDs.
+	// partitions for it are preferred, then those of its secondary
+	// architecture, then any other. "" is the architecture this program
+	// was built for, like systemd's native_architecture().
 	Arch string
-	// Policy is the systemd.image-policy(7) string applied to disk images
-	// ("" = the class default policy). Enforced for GPT DDIs with verity
-	// partitions; bare-filesystem images count as "unprotected".
+	// Policy is the systemd.image-policy(7) string applied to raw images;
+	// "" selects the default policy of Class.
 	Policy string
-	// TrustDir is the directory holding trusted PEM certificates (*.crt)
-	// for verity signature verification ("" = /etc/verity.d). See
-	// internal/image/signature.go for the trust model.
-	TrustDir string
+	// Class selects the default image policy.
+	Class release.Class
+	// TrustDirs are the directories holding trusted verity signing
+	// certificates (*.crt), in priority order; nil means TrustDirs("/").
+	TrustDirs []string
+	// Warnf, when set, receives non-fatal diagnostics (e.g. a signature
+	// that could not be verified when the policy also accepts plain
+	// verity).
+	Warnf func(format string, args ...any)
 }
 
-// Mount makes the image's tree available at mountPoint with the default
-// image policy. See MountWithOpts.
-func Mount(img discover.Image, mountPoint, arch string) (*Mounted, error) {
-	return MountWithOpts(img, mountPoint, MountOpts{Arch: arch})
+// Mounted is an image whose tree is accessible at Root.
+type Mounted struct {
+	// Root is the directory exposing the image's filesystem tree (for
+	// directory images the image path itself).
+	Root string
+	// RootHash is the lowercase hex dm-verity root hash the image was
+	// mounted with, "" when no verity protection is in use.
+	RootHash string
+
+	mounts []string
 }
 
-// MountWithOpts makes the image's tree available at mountPoint (which must
-// exist) and returns a Mounted handle.
-//
-//   - TypeDirectory: no mount; Root = img.Path.
-//   - TypeRaw bare filesystem: loop-attach read-only, mount at mountPoint.
-//   - TypeRaw GPT: loop-attach with partscan, pick the root partition for
-//     arch (SPEC §3 type GUIDs), else the usr partition (then the tree root
-//     is synthesized so the payload appears under <mountPoint>/usr).
-//
-// On any error all intermediate resources are released.
+// MountWithOpts makes the image's tree available at mountPoint, which must
+// exist. Directory images are used in place. Raw images are dissected and
+// their root partition (or a tmpfs when there is only a usr partition) is
+// mounted at mountPoint and the usr partition, if any, at mountPoint/usr,
+// both read-only. On error nothing stays mounted or attached; on success
+// unmounting the mount points releases the loop and dm devices.
 func MountWithOpts(img discover.Image, mountPoint string, opts MountOpts) (*Mounted, error) {
-	arch := opts.Arch
 	if img.Type == discover.TypeDirectory {
 		return &Mounted{Root: img.Path}, nil
 	}
-
-	fs, err := Detect(img.Path)
-	if err != nil {
-		return nil, fmt.Errorf("detecting format of %s: %w", img.Path, err)
-	}
-
-	policy, err := parseImagePolicy(opts.Policy)
+	policy, err := resolvePolicy(opts.Policy, opts.Class)
 	if err != nil {
 		return nil, err
 	}
+	if opts.Arch == "" {
+		opts.Arch = release.NativeArchitecture()
+	}
+	if opts.TrustDirs == nil {
+		opts.TrustDirs = TrustDirs("/")
+	}
+	m := &mounter{path: img.Path, mountPoint: mountPoint, opts: opts, policy: policy}
+	return m.mount()
+}
 
-	switch fs {
-	case FSSquashfs, FSErofs, FSExt4:
-		return mountBareFS(img.Path, mountPoint, fs, policy)
-	case FSGPT:
-		return mountGPT(img.Path, mountPoint, arch, policy, opts.TrustDir)
+// mounter holds the state of one MountWithOpts call so that every error
+// path (and panic) releases what was set up so far.
+type mounter struct {
+	path       string
+	mountPoint string
+	opts       MountOpts
+	policy     *imagePolicy
+
+	file *os.File
+	size int64
+	// block is set for block device images; sectorSize is then the
+	// device's logical sector size, 512 for image files.
+	block      bool
+	sectorSize int64
+	loops      []*loopDevice
+	verity     *verityDevice
+	mounts     []string
+}
+
+func (m *mounter) warnf(format string, args ...any) {
+	if m.opts.Warnf != nil {
+		m.opts.Warnf(format, args...)
+	}
+}
+
+func (m *mounter) mount() (*Mounted, error) {
+	f, err := os.OpenFile(m.path, os.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	m.file, m.sectorSize = f, 512
+	switch mode := fi.Mode(); {
+	case mode.IsRegular():
+		m.size = fi.Size()
+	case mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0:
+		m.block = true
+		if m.size, m.sectorSize, err = blockDeviceGeometry(f); err != nil {
+			return nil, fmt.Errorf("%s: %w", m.path, err)
+		}
 	default:
-		return nil, fmt.Errorf("%s: unrecognized image format", img.Path)
+		return nil, fmt.Errorf("%s: neither a regular file nor a block device", m.path)
 	}
+
+	ok := false
+	defer func() {
+		if !ok {
+			m.cleanup()
+		}
+	}()
+
+	vs, err := loadVeritySidecars(m.path)
+	if err != nil {
+		return nil, err
+	}
+	var res *Mounted
+	if vs.dataPath != "" {
+		res, err = m.mountWithExternalHashTree(vs)
+	} else {
+		res, err = m.mountRaw(vs)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", m.path, err)
+	}
+	if err := m.relinquish(); err != nil {
+		return nil, fmt.Errorf("%s: %w", m.path, err)
+	}
+	ok = true
+	return res, nil
 }
 
-// mountBareFS loop-attaches a partition-table-less raw image and mounts it.
-// Bare-filesystem images carry no verity metadata: they classify as an
-// unprotected root payload and the policy must allow that.
-func mountBareFS(path, mountPoint string, fs FSType, policy *imagePolicy) (*Mounted, error) {
-	if allowed := policy.forDesignator("root"); !allowed[protUnprotected] {
-		return nil, fmt.Errorf("%s: %w", path,
-			policyError("root", protUnprotected, allowed))
-	}
-	if err := policy.checkFS("root", fs); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-
-	loopDev, err := loopAttach(path, false)
+// mountRaw handles images without an external hash tree: a partition table
+// or a single filesystem.
+func (m *mounter) mountRaw(vs *veritySettings) (*Mounted, error) {
+	ss, err := probeSectorSize(m.file)
 	if err != nil {
 		return nil, err
 	}
-	if err := mountRO(loopDev, mountPoint, fs); err != nil {
-		_ = loopDetach(loopDev)
+	pt, err := readPartitionTable(m.file, m.size, pick(ss != 0, ss, m.sectorSize))
+	if err != nil && !errors.Is(err, errNoPartitionTable) {
 		return nil, err
 	}
-	return &Mounted{
-		Root:        mountPoint,
-		LoopDevice:  loopDev,
-		FS:          fs,
-		mountTarget: mountPoint,
-	}, nil
+	if pt != nil && pt.gpt {
+		return m.mountPartitioned(pt, vs)
+	}
+	fs, err := detectFS(m.file)
+	if err != nil {
+		return nil, err
+	}
+	if fs != "" {
+		return m.mountUnpartitioned(fs, vs)
+	}
+	if pt != nil {
+		return m.mountPartitioned(pt, vs)
+	}
+	return nil, errno.New(unix.ENOPKG, "no suitable partition table or file system found")
 }
 
-// mountGPT parses the partition table, enforces the image policy, attaches
-// the image with partition scanning, verifies the verity root-hash
-// signature when present (and the policy accepts "signed"), sets up
-// dm-verity when the image carries a verity partition (and the policy
-// allows it), and mounts the payload read-only.
-func mountGPT(path, mountPoint, arch string, policy *imagePolicy, trustDir string) (*Mounted, error) {
-	parts, err := parseGPTFile(path)
+// mountWithExternalHashTree handles images with a .verity sidecar, which
+// must be a single filesystem.
+func (m *mounter) mountWithExternalHashTree(vs *veritySettings) (*Mounted, error) {
+	fs, err := detectFS(m.file)
 	if err != nil {
-		return nil, fmt.Errorf("parsing GPT of %s: %w", path, err)
+		return nil, err
 	}
-	part, isUsr, err := selectPartition(parts, arch)
+	if fs == "" {
+		return nil, fmt.Errorf("external verity data %s given for an image that is not a single filesystem", vs.dataPath)
+	}
+	return m.mountUnpartitioned(fs, vs)
+}
+
+// mountUnpartitioned mirrors dissect_image_from_unpartitioned(): the whole
+// image is the root partition, verity protected when an external hash tree
+// and root hash cover it.
+func (m *mounter) mountUnpartitioned(fs fsType, vs *veritySettings) (*Mounted, error) {
+	found := polUnprotected
+	switch {
+	case vs.covers(partRoot):
+		found = pick(len(vs.sig) > 0, polSigned, polVerity)
+	case fs == fsLUKS:
+		found = polEncrypted | polEncryptedWithIntegrity
+	}
+	use, err := m.policy.mayUse(partRoot)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, err
 	}
-	guids := archGUIDs[arch] // selectPartition validated arch
-
-	designator := "root"
-	if isUsr {
-		designator = "usr"
+	if !use {
+		return nil, errno.New(unix.ENOPKG, "the image policy ignores the root partition")
+	}
+	if err := m.policy.checkProtection(partRoot, found); err != nil {
+		return nil, err
+	}
+	if err := m.policy.checkPartitionFlags(partRoot, 0); err != nil {
+		return nil, err
 	}
 
-	useVerity, checkSig, err := decideVerity(parts, guids, designator, policy)
+	loop, err := m.attach(m.file, 0, false)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, err
+	}
+	dev := loop.path
+	var rootHash []byte
+	if vs.covers(partRoot) && m.policy.exhaustive(partRoot)&(polVerity|polSigned) != 0 {
+		hf, err := os.OpenFile(vs.dataPath, os.O_RDONLY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return nil, err
+		}
+		defer hf.Close()
+		hashLoop, err := m.attach(hf, 0, false)
+		if err != nil {
+			return nil, err
+		}
+		if dev, err = m.setupVerity(partRoot, vs, hf, loop, loop.path, hashLoop.path); err != nil {
+			return nil, err
+		}
+		rootHash = vs.rootHash
+	}
+	if err := m.mountDevice(partRoot, dev, m.mountPoint); err != nil {
+		return nil, err
+	}
+	return m.result(rootHash), nil
+}
+
+// mountPartitioned dissects the partition table and mounts root and usr.
+func (m *mounter) mountPartitioned(pt *partitionTable, vs *veritySettings) (*Mounted, error) {
+	ds := &dissector{
+		table:     pt,
+		policy:    m.policy,
+		verity:    vs,
+		native:    m.opts.Arch,
+		readSig:   func(p partition) (*veritySig, error) { return readVeritySig(m.file, p, pt.sectorSize) },
+		machineID: hostMachineID,
+	}
+	d, err := ds.dissect()
+	if err != nil {
+		return nil, err
+	}
+	if err := m.checkFilesystems(d, pt.sectorSize); err != nil {
+		return nil, err
+	}
+	if err := d.loadSigPartitionRootHash(vs, m.file, pt.sectorSize); err != nil {
+		return nil, err
+	}
+	if err := d.guessRootHash(vs); err != nil {
+		return nil, err
 	}
 
-	loopDev, err := loopAttach(path, true)
+	loop, err := m.attach(m.file, uint32(pt.sectorSize), true)
 	if err != nil {
 		return nil, err
 	}
 
-	verityName := "" // set once a dm device exists; cleaned up on error
-	cleanup := func() {
-		if verityName != "" {
-			_ = verityRemove(verityName)
+	var rootHash []byte
+	devices := map[designator]string{}
+	for _, x := range []designator{partRoot, partUsr} {
+		if !d.found(x) {
+			continue
 		}
-		_ = loopDetach(loopDev)
+		node, err := loop.partitionNode(*d.parts[x], pt.sectorSize)
+		if err != nil {
+			return nil, err
+		}
+		devices[x] = node
+		if !m.useVerity(x, vs, d) {
+			continue
+		}
+		hash := d.parts[x.verityHash()]
+		hashNode, err := loop.partitionNode(*hash, pt.sectorSize)
+		if err != nil {
+			return nil, err
+		}
+		dm, err := m.setupVerity(x, vs, sectionReader(m.file, *hash, pt.sectorSize), loop, node, hashNode)
+		if err != nil {
+			return nil, err
+		}
+		devices[x] = dm
+		rootHash = vs.rootHash
 	}
 
-	partDev, err := ensurePartitionNode(loopDev, part.Index)
-	if err != nil {
-		cleanup()
+	if dev, ok := devices[partRoot]; ok {
+		if err := m.mountDevice(partRoot, dev, m.mountPoint); err != nil {
+			return nil, err
+		}
+	} else if err := m.mountRootTmpfs(); err != nil {
 		return nil, err
 	}
-
-	mountDev := partDev
-	verityDevPath := ""
-	if useVerity {
-		verityType, sigType := guids.rootVerity, guids.rootVeritySig
-		if isUsr {
-			verityType, sigType = guids.usrVerity, guids.usrVeritySig
+	if dev, ok := devices[partUsr]; ok {
+		target, err := m.usrMountPoint()
+		if err != nil {
+			return nil, err
 		}
-		vpart := findByType(parts, verityType) // non-nil: decideVerity classified it
+		if err := m.mountDevice(partUsr, dev, target); err != nil {
+			return nil, err
+		}
+	}
+	return m.result(rootHash), nil
+}
 
-		if checkSig {
-			// Image classified as signed and the policy accepts signed:
-			// verify the PKCS#7 signature over the GUID-reconstructed
-			// root hash before activating verity with it.
-			if serr := verifyImageSignature(loopDev, parts, sigType, part, *vpart, trustDir); serr != nil {
-				if policy.forDesignator(designator)[protVerity] {
-					// Policy also accepts plain verity: degrade with a
-					// warning, hash tree still enforced.
-					fmt.Fprintf(os.Stderr,
-						"Warning: %s: verity signature verification failed, continuing as unsigned verity (policy allows verity): %v\n",
-						path, serr)
-				} else {
-					cleanup()
-					return nil, fmt.Errorf("%s: verity signature verification failed: %w", path, serr)
-				}
+// checkFilesystems mirrors dissected_image_probe_filesystems(): every used
+// partition is probed, encrypted ones are checked against the policy.
+func (m *mounter) checkFilesystems(d *dissected, ss int64) error {
+	for x := range numDesignators {
+		if !d.found(x) {
+			continue
+		}
+		found := polUnused | polUnprotected | polVerity | polSigned
+		if !x.isVerityHash() && !x.isVeritySig() {
+			fs, err := detectFS(sectionReader(m.file, *d.parts[x], ss))
+			if err != nil {
+				return fmt.Errorf("%s partition: %w", x, err)
+			}
+			if fs == fsLUKS {
+				found = polUnused | polEncrypted | polEncryptedWithIntegrity
 			}
 		}
+		if err := m.policy.checkProtection(x, found); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-		verityDevPath, err = setupVerity(path, loopDev, part, *vpart, partDev)
+// useVerity mirrors the preconditions of systemd's verity_partition().
+func (m *mounter) useVerity(x designator, vs *veritySettings, d *dissected) bool {
+	if len(vs.rootHash) == 0 {
+		return false
+	}
+	if vs.designator != x && (vs.designator != partInvalid || x != partRoot) {
+		return false
+	}
+	if !d.found(x.verityHash()) {
+		return false
+	}
+	return m.policy.exhaustive(x)&(polVerity|polSigned) != 0
+}
+
+// VerityError is the error of a dm-verity activation that failed,
+// signature verification included (systemd's dissected_image_decrypt()).
+type VerityError struct {
+	// Partition is the designator of the data partition ("root", "usr").
+	Partition string
+	Err       error
+}
+
+func (e *VerityError) Error() string {
+	return "activating dm-verity for the " + e.Partition + " partition: " + e.Err.Error()
+}
+
+func (e *VerityError) Unwrap() error { return e.Err }
+
+// setupVerity activates dm-verity for designator x (systemd's
+// verity_partition() and do_crypt_activate_verity()) and returns the device
+// node to mount.
+func (m *mounter) setupVerity(x designator, vs *veritySettings, hash io.ReaderAt, loop *loopDevice, dataNode, hashNode string) (node string, err error) {
+	defer func() {
 		if err != nil {
-			cleanup()
-			return nil, err
+			err = &VerityError{Partition: x.String(), Err: err}
 		}
-		verityName = verityDeviceName(path)
-		mountDev = verityDevPath
-	}
-
-	fs, err := Detect(mountDev)
+	}()
+	sb, err := readVeritySuperblock(hash)
 	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("detecting filesystem on %s: %w", mountDev, err)
+		return "", err
 	}
-	if fs == FSUnknown || fs == FSGPT {
-		cleanup()
-		return nil, fmt.Errorf("%s: partition %d has unsupported filesystem", path, part.Index)
+	if err := sb.checkRootHash(vs.rootHash); err != nil {
+		return "", err
 	}
-	if err := policy.checkFS(designator, fs); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("%s: %w", path, err)
+	dataDev, err := nodeDevT(dataNode)
+	if err != nil {
+		return "", err
+	}
+	hashDev, err := nodeDevT(hashNode)
+	if err != nil {
+		return "", err
 	}
 
-	target := mountPoint
-	if isUsr {
-		// Only a usr partition: synthesize the tree root so the payload
-		// shows up under <mountPoint>/usr.
-		target = filepath.Join(mountPoint, "usr")
-		if err := os.MkdirAll(target, 0o755); err != nil {
-			cleanup()
-			return nil, err
+	pol := m.policy.exhaustive(x)
+	checkSig := len(vs.sig) > 0 && pol&polSigned != 0 && !envDisabled("SYSTEMD_DISSECT_VERITY_SIGNATURE")
+	if !checkSig && pol&polVerity == 0 {
+		return "", errno.New(unix.ERFKILL, "image does not satisfy image policy: activation of the %s partition without a verified signature is not allowed", x)
+	}
+
+	t := &verityTarget{
+		name:     verityDMName(dataNode, loop.diskseq),
+		sb:       sb,
+		dataDev:  dataDev,
+		hashDev:  hashDev,
+		rootHash: vs.rootHash,
+	}
+	var sig []byte
+	if checkSig {
+		sig = vs.sig
+	}
+	dev, err := activateVerity(t, sig, func(kernelErr error) error {
+		ok, reason, err := verifySignature(vs.rootHash, vs.sig, m.opts.TrustDirs)
+		if err != nil {
+			return err
 		}
+		if ok {
+			return nil
+		}
+		if pol&polVerity == 0 {
+			return fmt.Errorf("verity signature verification failed: %s (%w)", reason, kernelErr)
+		}
+		m.warnf("%s: verity signature verification failed, continuing as unsigned verity (policy allows verity): %s", m.path, reason)
+		return nil
+	})
+	if err != nil {
+		return "", err
 	}
+	m.verity = dev
+	return dev.node, nil
+}
 
-	if err := mountRO(mountDev, target, fs); err != nil {
-		cleanup()
+// nodeDevT returns "major:minor" of a block device node.
+func nodeDevT(node string) (string, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(node, &st); err != nil {
+		return "", fmt.Errorf("stat %s: %w", node, err)
+	}
+	return strconv.FormatUint(uint64(unix.Major(st.Rdev)), 10) + ":" + strconv.FormatUint(uint64(unix.Minor(st.Rdev)), 10), nil
+}
+
+// attach provides a loop device for f with the given logical block size
+// (0 = default) and partition scanning. A block device image is used as is
+// when that gives the same view of it, like systemd's
+// loop_device_make_internal() does.
+func (m *mounter) attach(f *os.File, blockSize uint32, partscan bool) (*loopDevice, error) {
+	var l *loopDevice
+	var err error
+	if f == m.file && m.useDeviceDirectly(blockSize, partscan) {
+		l, err = openBlockDevice(f)
+	} else {
+		l, err = loopAttach(f, blockSize, partscan)
+	}
+	if err != nil {
 		return nil, err
 	}
-	return &Mounted{
-		Root:         mountPoint,
-		LoopDevice:   loopDev,
-		Partition:    partDev,
-		VerityDevice: verityDevPath,
-		FS:           fs,
-		verityName:   verityName,
-		mountTarget:  target,
-	}, nil
+	m.loops = append(m.loops, l)
+	return l, nil
 }
 
-// decideVerity applies the image policy to the actual protection level of
-// the selected designator and reports whether dm-verity should be used
-// (useVerity), whether the verity root-hash signature must be verified
-// first (checkSig), or whether the image is rejected (error).
-//
-// Like systemd, the highest protection both sides accept is preferred:
-// when the image carries a verity signature partition and the policy
-// accepts "signed", the signature is verified (checkSig=true). If
-// verification later fails, the caller degrades to plain verity when the
-// policy also accepts "verity" (warning), otherwise the mount fails.
-// Signed images facing a policy that accepts "verity" but not "signed" are
-// mounted as plain verity without signature verification.
-func decideVerity(parts []gptPartition, guids dpsGUIDs, designator string, policy *imagePolicy) (useVerity, checkSig bool, err error) {
-	prot := classifyProtection(parts, guids, designator)
-	allowed := policy.forDesignator(designator)
-
-	switch prot {
-	case protUnprotected:
-		if !allowed[protUnprotected] {
-			return false, false, policyError(designator, prot, allowed)
-		}
-		return false, false, nil
-	case protVerity:
-		switch {
-		case allowed[protVerity]:
-			return true, false, nil
-		case allowed[protUnprotected]:
-			return false, false, nil
-		default:
-			// Policy accepts only signed/encrypted/absent: a plain
-			// verity image cannot satisfy it.
-			return false, false, policyError(designator, prot, allowed)
-		}
-	case protSigned:
-		switch {
-		case allowed[protSigned]:
-			// Verify the signature; on failure the caller degrades to
-			// plain verity iff allowed[protVerity].
-			return true, true, nil
-		case allowed[protVerity]:
-			// Treat the signed image as plain verity (signature not
-			// verified, hash tree still enforced).
-			return true, false, nil
-		case allowed[protUnprotected]:
-			return false, false, nil
-		default:
-			return false, false, policyError(designator, prot, allowed)
-		}
-	default: // protAbsent cannot happen for the selected partition
-		return false, false, policyError(designator, prot, allowed)
+// useDeviceDirectly is loop_device_can_shortcut(): a block device image
+// needs no loop device when the requested sector size is its own and, if
+// partitions are wanted, the kernel scans its partition table already.
+// Partitions are only wanted for images with a partition table, so the
+// exception systemd makes for devices without one never applies.
+func (m *mounter) useDeviceDirectly(blockSize uint32, partscan bool) bool {
+	if !m.block || (blockSize != 0 && int64(blockSize) != m.sectorSize) {
+		return false
 	}
+	if !partscan {
+		return true
+	}
+	dir, err := blockSysDir(m.file)
+	return err == nil && partscanEnabled(dir)
 }
 
-// setupVerity prepares and activates the dm-verity device for the selected
-// data partition: resolves the verity partition node, reads the verity
-// superblock, reconstructs the root hash from the unique partition GUIDs,
-// and creates the device-mapper device. Returns the dm device node path.
-func setupVerity(imagePath, loopDev string, data, verity gptPartition, dataDev string) (string, error) {
-	hashDev, err := ensurePartitionNode(loopDev, verity.Index)
+// mountDevice probes and mounts the filesystem on dev read-only at target.
+func (m *mounter) mountDevice(x designator, dev, target string) error {
+	f, err := os.OpenFile(dev, os.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	fs, err := detectFS(f)
+	f.Close()
+	if err != nil {
+		return fmt.Errorf("%s partition: %w", x, err)
+	}
+	switch {
+	case fs == "":
+		return errno.New(unix.EAFNOSUPPORT, "%s partition: file system type not supported or not known", x)
+	case fs == fsLUKS:
+		return errno.New(unix.EUNATCH, "%s partition: encrypted (LUKS) partitions are not supported", x)
+	case !fsTypeAllowed(fs):
+		return errno.New(unix.EIDRM, "%s partition: file system %s is not allowed for automatic mounting", x, fs)
+	}
+	if err := m.policy.checkFS(x, fs); err != nil {
+		return err
+	}
+	if err := mountReadOnly(dev, target, fs); err != nil {
+		return err
+	}
+	m.mounts = append(m.mounts, target)
+	return nil
+}
+
+// mountRootTmpfs provides the tree root for images with only a usr
+// partition, like systemd's mount_root_tmpfs().
+func (m *mounter) mountRootTmpfs() error {
+	if err := unix.Mount("rootfs", m.mountPoint, "tmpfs", unix.MS_NODEV, ""); err != nil {
+		return fmt.Errorf("mounting tmpfs at %s: %w", m.mountPoint, err)
+	}
+	m.mounts = append(m.mounts, m.mountPoint)
+	return nil
+}
+
+// usrMountPoint resolves /usr inside the mounted root, creating it when the
+// root is writable (the tmpfs of usr-only images).
+func (m *mounter) usrMountPoint() (string, error) {
+	p, err := fsutil.Chase(m.mountPoint, "/usr", 0)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(filepath.Join(m.mountPoint, "usr"), 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			return "", fmt.Errorf("root partition has no /usr directory to mount the usr partition on: %w", err)
+		}
+		p, err = fsutil.Chase(m.mountPoint, "/usr", 0)
+	}
 	if err != nil {
 		return "", err
 	}
-
-	sb, err := readVeritySuperblock(hashDev)
-	if err != nil {
-		return "", err
-	}
-	// The GUID-embedded root hash is exactly 256 bits; only digest
-	// algorithms with 32-byte output can be carried this way.
-	if sb.Algorithm != "sha256" {
-		return "", fmt.Errorf("%s: verity algorithm %q not supported for GUID root-hash discovery (need sha256)", imagePath, sb.Algorithm)
-	}
-
-	rootHash, err := rootHashFromGUIDs(data.UniqueGUID, verity.UniqueGUID)
-	if err != nil {
-		return "", fmt.Errorf("%s: %w", imagePath, err)
-	}
-
-	name := verityDeviceName(imagePath)
-	devPath, err := verityActivate(name, sb, dataDev, hashDev, rootHash)
-	if err != nil {
-		return "", fmt.Errorf("%s: activating dm-verity: %w", imagePath, err)
-	}
-	return devPath, nil
+	return p, nil
 }
 
-// mountRO mounts a read-only nodev filesystem.
-func mountRO(device, target string, fs FSType) error {
-	err := unix.Mount(device, target, string(fs), unix.MS_RDONLY|unix.MS_NODEV, "")
+// mountOptions mirrors fstype_norecovery_option(): read-only mounts must not
+// replay journals, which would write to the image.
+func mountOptions(fs fsType) []string {
+	switch fs {
+	case fsExt3, fsExt4, fsXFS:
+		return []string{"norecovery"}
+	case fsBtrfs:
+		return []string{"rescue=nologreplay", "norecovery"}
+	case fsF2FS:
+		return []string{"norecovery", ""}
+	default:
+		return []string{""}
+	}
+}
+
+// mountReadOnly mounts a filesystem read-only and nodev, trying the
+// norecovery-style options in order until the kernel accepts one.
+func mountReadOnly(device, target string, fs fsType) error {
+	var err error
+	for _, data := range mountOptions(fs) {
+		err = unix.Mount(device, target, string(fs), unix.MS_RDONLY|unix.MS_NODEV, data)
+		if !errors.Is(err, unix.EINVAL) {
+			break
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("mounting %s (%s) at %s: %w", device, fs, target, err)
 	}
 	return nil
 }
 
-// Unmount releases the mount, removes the dm-verity device (if any) and
-// detaches the loop device. Safe to call on directory-backed images (no-op).
-func (m *Mounted) Unmount() error {
-	if m == nil || (m.LoopDevice == "" && m.mountTarget == "") {
-		return nil // directory image
+func (m *mounter) result(rootHash []byte) *Mounted {
+	res := &Mounted{Root: m.mountPoint, mounts: m.mounts}
+	if len(rootHash) > 0 {
+		res.RootHash = hex.EncodeToString(rootHash)
 	}
-
-	targets := []string{m.mountTarget}
-	if m.mountTarget == "" {
-		// Handle reconstructed from lost state: try both possible targets.
-		targets = []string{filepath.Join(m.Root, "usr"), m.Root}
-	}
-
-	var firstErr error
-	for _, t := range targets {
-		if t == "" {
-			continue
-		}
-		if err := unmountTolerant(t); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-
-	if m.verityName != "" {
-		if err := verityRemove(m.verityName); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-
-	if m.LoopDevice != "" {
-		if err := loopDetach(m.LoopDevice); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
+	return res
 }
 
-// RemoveVerityFor tears down the dm-verity device that MountWithOpts would
-// have created for the image at path ("sysext-<name>-verity"). Used by
-// unmerge cleanup, where the Mounted handle from the original merge process
-// is gone. Idempotent: a missing device is not an error.
-func RemoveVerityFor(path string) error {
-	return verityRemove(verityDeviceName(path))
+// relinquish hands loop and dm lifetime to the kernel once mounted.
+func (m *mounter) relinquish() error {
+	if m.verity != nil {
+		if err := m.verity.relinquish(); err != nil {
+			return err
+		}
+		m.verity = nil
+	}
+	for _, l := range m.loops {
+		l.relinquish()
+	}
+	m.loops = nil
+	return nil
+}
+
+func (m *mounter) cleanup() {
+	for _, t := range slices.Backward(m.mounts) {
+		_ = unmountTolerant(t)
+	}
+	if m.verity != nil {
+		m.verity.remove()
+	}
+	for _, l := range m.loops {
+		l.detach()
+	}
+}
+
+// Unmount unmounts everything MountWithOpts mounted, deepest first. The
+// kernel then releases the dm-verity and loop devices. Directory images
+// are a no-op.
+func (m *Mounted) Unmount() error {
+	if m == nil {
+		return nil
+	}
+	var errs []error
+	for _, t := range slices.Backward(m.mounts) {
+		if err := unmountTolerant(t); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	m.mounts = nil
+	return errors.Join(errs...)
 }
 
 // unmountTolerant unmounts target, ignoring "not mounted"/missing errors and
@@ -412,10 +627,7 @@ func RemoveVerityFor(path string) error {
 func unmountTolerant(target string) error {
 	err := unix.Unmount(target, 0)
 	switch {
-	case err == nil:
-		return nil
-	case errors.Is(err, unix.EINVAL), errors.Is(err, unix.ENOENT):
-		// Not a mount point / already gone.
+	case err == nil, errors.Is(err, unix.EINVAL), errors.Is(err, unix.ENOENT):
 		return nil
 	case errors.Is(err, unix.EBUSY):
 		if err := unix.Unmount(target, unix.MNT_DETACH); err != nil &&
@@ -426,43 +638,4 @@ func unmountTolerant(target string) error {
 	default:
 		return fmt.Errorf("unmount %s: %w", target, err)
 	}
-}
-
-// DetachAllLoopsFor detaches any loop devices whose backing file is path.
-// Used by unmerge cleanup when state was lost.
-func DetachAllLoopsFor(path string) error {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		abs = path
-	}
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		resolved = abs
-	}
-
-	backings, err := filepath.Glob("/sys/block/loop*/loop/backing_file")
-	if err != nil {
-		return err
-	}
-
-	var firstErr error
-	for _, bf := range backings {
-		data, err := os.ReadFile(bf)
-		if err != nil {
-			continue // device went away
-		}
-		backing := strings.TrimSpace(string(data))
-		// The kernel appends " (deleted)" when the backing file was
-		// unlinked while attached.
-		backing = strings.TrimSuffix(backing, " (deleted)")
-		if backing != abs && backing != resolved {
-			continue
-		}
-		// /sys/block/loopN/loop/backing_file -> /dev/loopN
-		devName := filepath.Base(filepath.Dir(filepath.Dir(bf)))
-		if err := loopDetach("/dev/" + devName); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
 }

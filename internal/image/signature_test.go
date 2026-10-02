@@ -1,15 +1,16 @@
 package image
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -20,16 +21,15 @@ import (
 	"github.com/smallstep/pkcs7"
 )
 
-// testRootHash is a syntactically valid sha256 verity root hash.
-const testRootHash = "2ee82d1b9b1e21ebe6943d808cee0b6dd51e0c8cd06a3c3e1f8120a08e42b7bf"
+var testRootHash = bytes.Repeat([]byte{0x2e, 0xe8, 0x2d, 0x1b}, 8)
 
 type testIdentity struct {
 	key  *rsa.PrivateKey
 	cert *x509.Certificate
 }
 
-// newIdentity generates an RSA key and a certificate with the given subject,
-// self-signed when parent is nil, otherwise issued by parent.
+// newIdentity generates a key and certificate, self-signed when parent is
+// nil, otherwise issued by parent.
 func newIdentity(t *testing.T, cn string, isCA bool, notBefore, notAfter time.Time, parent *testIdentity) *testIdentity {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -60,43 +60,52 @@ func newIdentity(t *testing.T, cn string, isCA bool, notBefore, notAfter time.Ti
 	return &testIdentity{key: key, cert: cert}
 }
 
-func validIdentity(t *testing.T, cn string, isCA bool, parent *testIdentity) *testIdentity {
-	return newIdentity(t, cn, isCA,
-		time.Now().Add(-time.Hour), time.Now().Add(time.Hour), parent)
+func validIdentity(t *testing.T, cn string, parent *testIdentity) *testIdentity {
+	return newIdentity(t, cn, parent == nil, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), parent)
 }
 
-// signRootHash produces a detached PKCS#7 signature (DER) over the ASCII
-// hex string, embedding the signer certificate plus any extra certs.
-func signRootHash(t *testing.T, rootHash string, id *testIdentity, extra ...*x509.Certificate) []byte {
+type signOpts struct {
+	noAttrs  bool
+	noCerts  bool
+	content  string
+	extra    []*x509.Certificate
+	attached bool
+}
+
+// sign produces a PKCS#7 signature (DER) over the lowercase hex root hash.
+func sign(t *testing.T, rootHash []byte, id *testIdentity, o signOpts) []byte {
 	t.Helper()
-	sd, err := pkcs7.NewSignedData([]byte(rootHash))
+	content := o.content
+	if content == "" {
+		content = hex.EncodeToString(rootHash)
+	}
+	sd, err := pkcs7.NewSignedData([]byte(content))
 	if err != nil {
 		t.Fatal(err)
 	}
 	sd.SetDigestAlgorithm(pkcs7.OIDDigestAlgorithmSHA256)
-	if err := sd.AddSigner(id.cert, id.key, pkcs7.SignerInfoConfig{}); err != nil {
+	if o.noAttrs {
+		err = sd.SignWithoutAttr(id.cert, id.key, pkcs7.SignerInfoConfig{})
+	} else {
+		err = sd.AddSigner(id.cert, id.key, pkcs7.SignerInfoConfig{})
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range extra {
+	for _, c := range o.extra {
 		sd.AddCertificate(c)
 	}
-	sd.Detach()
+	if o.noCerts {
+		sd.GetSignedData().Certificates.Raw = nil
+	}
+	if !o.attached {
+		sd.Detach()
+	}
 	der, err := sd.Finish()
 	if err != nil {
 		t.Fatal(err)
 	}
 	return der
-}
-
-// trustDirWith writes the given certificates as PEM files into a fresh
-// directory and returns its path.
-func trustDirWith(t *testing.T, certs ...*x509.Certificate) string {
-	t.Helper()
-	dir := t.TempDir()
-	for i, c := range certs {
-		writeCertPEM(t, filepath.Join(dir, "anchor"+string(rune('a'+i))+".crt"), c)
-	}
-	return dir
 }
 
 func writeCertPEM(t *testing.T, path string, certs ...*x509.Certificate) {
@@ -105,243 +114,308 @@ func writeCertPEM(t *testing.T, path string, certs ...*x509.Certificate) {
 	for _, c := range certs {
 		buf = append(buf, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})...)
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, buf, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func sigFor(t *testing.T, rootHash string, id *testIdentity, extra ...*x509.Certificate) *veritySig {
+// trustRoot creates a root with the given certificates in /etc/verity.d.
+func trustRoot(t *testing.T, certs ...*x509.Certificate) []string {
 	t.Helper()
-	return &veritySig{
-		RootHash:  rootHash,
-		Signature: base64.StdEncoding.EncodeToString(signRootHash(t, rootHash, id, extra...)),
+	root := t.TempDir()
+	for i, c := range certs {
+		writeCertPEM(t, filepath.Join(root, "etc/verity.d", string(rune('a'+i))+".crt"), c)
 	}
+	return TrustDirs(root)
 }
 
-func TestVerifySignatureValid(t *testing.T) {
-	id := validIdentity(t, "sysext-test", false, nil)
-	trust := trustDirWith(t, id.cert)
-
-	if err := verifySignature(sigFor(t, testRootHash, id), testRootHash, trust); err != nil {
-		t.Fatalf("valid signature rejected: %v", err)
-	}
-}
-
-func TestVerifySignatureRootHashMismatch(t *testing.T) {
-	id := validIdentity(t, "sysext-test", false, nil)
-	trust := trustDirWith(t, id.cert)
-
-	other := strings.Repeat("ab", 32)
-	err := verifySignature(sigFor(t, testRootHash, id), other, trust)
-	if err == nil || !strings.Contains(err.Error(), "does not match") {
-		t.Fatalf("err = %v, want rootHash mismatch", err)
-	}
-}
-
-func TestVerifySignatureSignedWrongHash(t *testing.T) {
-	// Signature is over a different string than the rootHash field claims.
-	id := validIdentity(t, "sysext-test", false, nil)
-	trust := trustDirWith(t, id.cert)
-
-	sig := &veritySig{
-		RootHash:  testRootHash,
-		Signature: base64.StdEncoding.EncodeToString(signRootHash(t, strings.Repeat("cd", 32), id)),
-	}
-	err := verifySignature(sig, testRootHash, trust)
-	if err == nil || !strings.Contains(err.Error(), "verification failed") {
-		t.Fatalf("err = %v, want signature verification failure", err)
-	}
-}
-
-func TestVerifySignatureUntrustedSigner(t *testing.T) {
-	signer := validIdentity(t, "sysext-evil", false, nil)
-	other := validIdentity(t, "sysext-good", false, nil)
-	trust := trustDirWith(t, other.cert)
-
-	err := verifySignature(sigFor(t, testRootHash, signer), testRootHash, trust)
-	if err == nil || !strings.Contains(err.Error(), "not trusted") {
-		t.Fatalf("err = %v, want untrusted signer", err)
-	}
-}
-
-func TestVerifySignatureChainsToAnchor(t *testing.T) {
-	ca := validIdentity(t, "sysext-ca", true, nil)
-	leaf := validIdentity(t, "sysext-leaf", false, ca)
-	trust := trustDirWith(t, ca.cert) // only the CA is trusted
-
-	if err := verifySignature(sigFor(t, testRootHash, leaf, ca.cert), testRootHash, trust); err != nil {
-		t.Fatalf("chained signer rejected: %v", err)
-	}
-}
-
-func TestVerifySignatureCorruptBase64(t *testing.T) {
-	id := validIdentity(t, "sysext-test", false, nil)
-	trust := trustDirWith(t, id.cert)
-
-	sig := sigFor(t, testRootHash, id)
-	sig.Signature = "!!!not-base64!!!"
-	err := verifySignature(sig, testRootHash, trust)
-	if err == nil || !strings.Contains(err.Error(), "base64") {
-		t.Fatalf("err = %v, want base64 decode failure", err)
-	}
-}
-
-func TestVerifySignatureCorruptDER(t *testing.T) {
-	id := validIdentity(t, "sysext-test", false, nil)
-	trust := trustDirWith(t, id.cert)
-
-	sig := sigFor(t, testRootHash, id)
-	sig.Signature = base64.StdEncoding.EncodeToString([]byte("garbage, not PKCS#7"))
-	if err := verifySignature(sig, testRootHash, trust); err == nil {
-		t.Fatal("corrupt DER accepted")
-	}
-}
-
-func TestVerifySignatureFingerprint(t *testing.T) {
-	id := validIdentity(t, "sysext-test", false, nil)
-	trust := trustDirWith(t, id.cert)
-
-	fp := sha256.Sum256(id.cert.Raw)
-	sig := sigFor(t, testRootHash, id)
-	sig.CertificateFingerprint = hex.EncodeToString(fp[:])
-	if err := verifySignature(sig, testRootHash, trust); err != nil {
-		t.Fatalf("matching fingerprint rejected: %v", err)
-	}
-
-	sig.CertificateFingerprint = strings.Repeat("00", 32)
-	err := verifySignature(sig, testRootHash, trust)
-	if err == nil || !strings.Contains(err.Error(), "certificateFingerprint") {
-		t.Fatalf("err = %v, want fingerprint mismatch", err)
-	}
-}
-
-func TestVerifySignatureExpiredSigner(t *testing.T) {
-	expired := newIdentity(t, "sysext-expired", false,
-		time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour), nil)
-	trust := trustDirWith(t, expired.cert)
-
-	// Rejected either by the pkcs7 signing-time check (signed attributes
-	// present) or by our explicit validity-period check (no attributes);
-	// both mention the certificate validity.
-	err := verifySignature(sigFor(t, testRootHash, expired), testRootHash, trust)
-	if err == nil || !strings.Contains(err.Error(), "validity") {
-		t.Fatalf("err = %v, want expired certificate rejection", err)
-	}
-
-	// Without authenticated attributes (the -noattr case) our explicit
-	// expiry check must catch it.
-	sd, err := pkcs7.NewSignedData([]byte(testRootHash))
+func mustVerify(t *testing.T, sig []byte, dirs []string, wantOK bool) {
+	t.Helper()
+	ok, reason, err := verifySignature(testRootHash, sig, dirs)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("verifySignature: %v", err)
 	}
-	sd.SetDigestAlgorithm(pkcs7.OIDDigestAlgorithmSHA256)
-	if err := sd.SignWithoutAttr(expired.cert, expired.key, pkcs7.SignerInfoConfig{}); err != nil {
-		t.Fatal(err)
-	}
-	sd.Detach()
-	der, err := sd.Finish()
-	if err != nil {
-		t.Fatal(err)
-	}
-	sig := &veritySig{RootHash: testRootHash, Signature: base64.StdEncoding.EncodeToString(der)}
-	err = verifySignature(sig, testRootHash, trust)
-	if err == nil || !strings.Contains(err.Error(), "validity period") {
-		t.Fatalf("err = %v, want explicit validity-period rejection", err)
+	if ok != wantOK {
+		t.Fatalf("verifySignature = %v (%s), want %v", ok, reason, wantOK)
 	}
 }
 
-func TestVerifySignatureMultipleAnchors(t *testing.T) {
-	id := validIdentity(t, "sysext-test", false, nil)
-	otherA := validIdentity(t, "other-a", false, nil)
-	otherB := validIdentity(t, "other-b", false, nil)
-	trust := trustDirWith(t, otherA.cert, id.cert, otherB.cert)
+func TestVerifySignatureTrustModel(t *testing.T) {
+	signer := validIdentity(t, "signer", nil)
+	other := validIdentity(t, "other", nil)
+	ca := validIdentity(t, "ca", nil)
+	leaf := validIdentity(t, "leaf", ca)
+	expired := newIdentity(t, "expired", false, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour), nil)
 
-	if err := verifySignature(sigFor(t, testRootHash, id), testRootHash, trust); err != nil {
-		t.Fatalf("signer among multiple anchors rejected: %v", err)
+	t.Run("signer is an anchor", func(t *testing.T) {
+		mustVerify(t, sign(t, testRootHash, signer, signOpts{}), trustRoot(t, signer.cert), true)
+	})
+	t.Run("signature without embedded certificates", func(t *testing.T) {
+		mustVerify(t, sign(t, testRootHash, signer, signOpts{noCerts: true, noAttrs: true}), trustRoot(t, signer.cert), true)
+	})
+	t.Run("untrusted signer", func(t *testing.T) {
+		mustVerify(t, sign(t, testRootHash, signer, signOpts{}), trustRoot(t, other.cert), false)
+	})
+	t.Run("only the issuing CA is trusted", func(t *testing.T) {
+		mustVerify(t, sign(t, testRootHash, leaf, signOpts{extra: []*x509.Certificate{ca.cert}}), trustRoot(t, ca.cert), false)
+	})
+	t.Run("expired signer without attributes", func(t *testing.T) {
+		mustVerify(t, sign(t, testRootHash, expired, signOpts{noAttrs: true}), trustRoot(t, expired.cert), true)
+	})
+	t.Run("expired signer with signing time", func(t *testing.T) {
+		mustVerify(t, sign(t, testRootHash, expired, signOpts{}), trustRoot(t, expired.cert), true)
+	})
+	t.Run("signed content differs", func(t *testing.T) {
+		mustVerify(t, sign(t, testRootHash, signer, signOpts{content: strings.Repeat("cd", 32)}), trustRoot(t, signer.cert), false)
+	})
+	t.Run("signature over uppercase hex", func(t *testing.T) {
+		upper := strings.ToUpper(hex.EncodeToString(testRootHash))
+		mustVerify(t, sign(t, testRootHash, signer, signOpts{content: upper}), trustRoot(t, signer.cert), false)
+	})
+	t.Run("attached content is ignored", func(t *testing.T) {
+		mustVerify(t, sign(t, testRootHash, signer, signOpts{content: "other content", attached: true}), trustRoot(t, signer.cert), false)
+	})
+	t.Run("malformed certificate next to a valid one", func(t *testing.T) {
+		dirs := trustRoot(t, signer.cert)
+		if err := os.WriteFile(filepath.Join(dirs[0], "0-garbage.crt"), []byte("-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustVerify(t, sign(t, testRootHash, signer, signOpts{}), dirs, true)
+	})
+	t.Run("only the first certificate of a file counts", func(t *testing.T) {
+		root := t.TempDir()
+		writeCertPEM(t, filepath.Join(root, "etc/verity.d/bundle.crt"), other.cert, signer.cert)
+		mustVerify(t, sign(t, testRootHash, signer, signOpts{}), TrustDirs(root), false)
+	})
+}
+
+func TestVerifySignatureMalformedDER(t *testing.T) {
+	signer := validIdentity(t, "signer", nil)
+	dirs := trustRoot(t, signer.cert)
+	for _, der := range [][]byte{{0x1f, 0x80}, {0x1f, 0x05}, {0x30, 0x81}, {0x30, 0x84, 0x01}, []byte("garbage")} {
+		if _, _, err := verifySignature(testRootHash, der, dirs); err == nil {
+			t.Errorf("malformed DER %x accepted", der)
+		}
 	}
-
-	// Multiple PEM blocks inside one .crt file must also work.
-	dir := t.TempDir()
-	writeCertPEM(t, filepath.Join(dir, "bundle.crt"), otherA.cert, id.cert)
-	if err := verifySignature(sigFor(t, testRootHash, id), testRootHash, dir); err != nil {
-		t.Fatalf("signer in multi-block bundle rejected: %v", err)
+	// Without trust anchors the signature is never parsed.
+	ok, reason, err := verifySignature(testRootHash, []byte{0x30, 0x81}, TrustDirs(t.TempDir()))
+	if ok || err != nil || !strings.Contains(reason, "no trusted certificates") {
+		t.Errorf("no anchors: ok=%v reason=%q err=%v", ok, reason, err)
 	}
 }
 
-func TestVerifySignatureNoTrustAnchors(t *testing.T) {
-	id := validIdentity(t, "sysext-test", false, nil)
+// nested wraps content in depth definite-length SEQUENCEs.
+func nested(depth int, content []byte) []byte {
+	der := content
+	for range depth {
+		var l []byte
+		switch n := len(der); {
+		case n < 0x80:
+			l = []byte{byte(n)}
+		case n < 0x100:
+			l = []byte{0x81, byte(n)}
+		default:
+			l = []byte{0x82, byte(n >> 8), byte(n)}
+		}
+		der = append(append([]byte{0x30}, l...), der...)
+	}
+	return der
+}
 
-	for _, dir := range []string{
-		filepath.Join(t.TempDir(), "does-not-exist"), // missing dir
-		t.TempDir(), // empty dir
+func TestCheckBERDepth(t *testing.T) {
+	signer := validIdentity(t, "signer", nil)
+	indefinite := func(depth int) []byte {
+		b := bytes.Repeat([]byte{0x30, 0x80}, depth)
+		b = append(b, 0x04, 0x00)
+		return append(b, bytes.Repeat([]byte{0x00, 0x00}, depth)...)
+	}
+	for _, tc := range []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"signature", sign(t, testRootHash, signer, signOpts{}), ""},
+		{"trailing data", append(nested(2, []byte{0x04, 0x00}), 0xff, 0xff), ""},
+		{"high tag number", []byte{0x3f, 0x81, 0x01, 0x02, 0x04, 0x00}, ""},
+		{"empty constructed", []byte{0x30, 0x00, 0x00}, ""},
+		{"32 definite levels", nested(32, []byte{0x04, 0x00}), ""},
+		{"33 definite levels", nested(33, []byte{0x04, 0x00}), "deeper than 32"},
+		{"32 indefinite levels", indefinite(32), ""},
+		{"33 indefinite levels", indefinite(33), "deeper than 32"},
+		{"unterminated nesting", bytes.Repeat([]byte{0x30, 0x80}, 1<<20), "deeper than 32"},
+		// The converter reads one child of an indefinite object before it
+		// looks for the end-of-contents octets, so these nest.
+		{"end-of-contents first", bytes.Repeat([]byte{0x30, 0x80, 0x00, 0x00}, 40), "deeper than 32"},
+		{"empty", nil, "truncated"},
+		{"truncated length", []byte{0x30, 0x84, 0x01}, "too long"},
+		{"truncated content", []byte{0x04, 0x05, 0x00}, "truncated"},
+		{"unterminated", []byte{0x30, 0x80, 0x04, 0x00}, "unterminated"},
+		{"primitive indefinite", []byte{0x04, 0x80, 0x00, 0x00}, "primitive"},
+		{"length with leading zero", []byte{0x04, 0x81, 0x00}, "malformed"},
+		{"negative length", []byte{0x04, 0x84, 0x80, 0x00, 0x00, 0x00, 0x00}, "malformed"},
+		{"five length octets", []byte{0x04, 0x85, 0x01, 0x00, 0x00, 0x00, 0x00}, "too long"},
+		{"huge length", []byte{0x04, 0x84, 0x7f, 0xff, 0xff, 0xff, 0x00}, "truncated"},
 	} {
-		err := verifySignature(sigFor(t, testRootHash, id), testRootHash, dir)
-		if err == nil || !strings.Contains(err.Error(), "no trust anchors") {
-			t.Fatalf("trust dir %s: err = %v, want no-trust-anchors", dir, err)
+		err := checkBERDepth(tc.data, maxBERDepth)
+		if (err == nil) != (tc.want == "") || (err != nil && !strings.Contains(err.Error(), tc.want)) {
+			t.Errorf("%s: checkBERDepth = %v, want %q", tc.name, err, tc.want)
 		}
 	}
 }
 
-func TestParseVeritySigPadding(t *testing.T) {
-	raw, err := json.Marshal(&veritySig{RootHash: testRootHash, Signature: "c2ln"})
+func TestParsePKCS7Limits(t *testing.T) {
+	signer := validIdentity(t, "signer", nil)
+	dirs := trustRoot(t, signer.cert)
+	padded := nested(1, append(sign(t, testRootHash, signer, signOpts{}), make([]byte, maxSignatureSize)...))
+	if _, _, err := verifySignature(testRootHash, padded, dirs); err == nil || !strings.Contains(err.Error(), "more than the 65536 allowed") {
+		t.Errorf("oversized signature: %v", err)
+	}
+	// Deep nesting within the signature partition limit used to overflow
+	// the stack of the recursive parser, which cannot be recovered from.
+	deep := bytes.Repeat([]byte{0x30, 0x80}, maxSignatureSize/2)
+	if _, _, err := verifySignature(testRootHash, deep, dirs); err == nil || !strings.Contains(err.Error(), "deeper than") {
+		t.Errorf("deeply nested signature: %v", err)
+	}
+	blob := fmt.Appendf(nil, `{"rootHash":"%x","signature":"%s"}`, testRootHash,
+		base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x30, 0x80}, 1_500_000)))
+	vsig, err := parseVeritySig(blob)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// NUL-pad to a multiple of 4096 like the spec mandates.
-	padded := make([]byte, (len(raw)+4095)&^4095)
-	copy(padded, raw)
-	if len(padded)%4096 != 0 {
-		t.Fatalf("test bug: padded length %d not a 4096 multiple", len(padded))
-	}
-
-	sig, err := parseVeritySig(padded)
-	if err != nil {
-		t.Fatalf("padded signature blob rejected: %v", err)
-	}
-	if sig.RootHash != testRootHash || sig.Signature != "c2ln" {
-		t.Fatalf("unexpected parse result: %+v", sig)
+	if _, _, err := verifySignature(vsig.RootHash, vsig.Signature, dirs); err == nil {
+		t.Error("deeply nested signature from a signature partition accepted")
 	}
 }
 
-func TestParseVeritySigMissingFields(t *testing.T) {
-	for _, blob := range []string{
-		`{"signature":"c2ln"}`,
-		`{"rootHash":"` + testRootHash + `"}`,
-		`not json at all`,
-	} {
-		if _, err := parseVeritySig([]byte(blob)); err == nil {
-			t.Errorf("blob %q accepted, want error", blob)
+func TestVerifySignatureUserspaceSwitches(t *testing.T) {
+	signer := validIdentity(t, "signer", nil)
+	dirs := trustRoot(t, signer.cert)
+	sig := sign(t, testRootHash, signer, signOpts{})
+
+	t.Setenv("SYSTEMD_PROC_CMDLINE", "quiet")
+	t.Setenv("SYSTEMD_ALLOW_USERSPACE_VERITY", "0")
+	mustVerify(t, sig, dirs, false)
+	t.Setenv("SYSTEMD_ALLOW_USERSPACE_VERITY", "bogus")
+	mustVerify(t, sig, dirs, false)
+	t.Setenv("SYSTEMD_ALLOW_USERSPACE_VERITY", "yes")
+	mustVerify(t, sig, dirs, true)
+	t.Setenv("SYSTEMD_PROC_CMDLINE", "systemd.allow_userspace_verity=1 systemd.allow-userspace-verity=no")
+	mustVerify(t, sig, dirs, false)
+	t.Setenv("SYSTEMD_PROC_CMDLINE", "systemd.allow_userspace_verity=0 systemd.allow_userspace_verity")
+	mustVerify(t, sig, dirs, false)
+	t.Setenv("SYSTEMD_PROC_CMDLINE", "systemd.allow_userspace_verity")
+	mustVerify(t, sig, dirs, true)
+}
+
+func TestTrustAnchorFiles(t *testing.T) {
+	root := t.TempDir()
+	dirs := TrustDirs(root)
+	write := func(rel, content string) {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
+	write("usr/lib/verity.d/a.crt", "x")
+	write("usr/local/lib/verity.d/a.crt", "x")
+	write("run/verity.d/b.crt", "x")
+	write("usr/lib/verity.d/b.crt", "x")
+	write("usr/lib/verity.d/c.crt", "x")
+	write("etc/verity.d/c.crt", "")
+	write("usr/lib/verity.d/d.crt", "x")
+	if err := os.Symlink("/dev/null", filepath.Join(root, "run/verity.d/d.crt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "etc/verity.d/e.crt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write("usr/lib/verity.d/e.crt", "x")
+	write("usr/lib/verity.d/f.pem", "x")
+	write("etc/verity.d/.g.crt", "x")
+
+	got := trustAnchorFiles(dirs)
+	want := []string{
+		filepath.Join(root, "usr/local/lib/verity.d/a.crt"),
+		filepath.Join(root, "run/verity.d/b.crt"),
+		filepath.Join(root, "usr/lib/verity.d/e.crt"),
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("trustAnchorFiles =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+
+	if d := TrustDirs("/"); d[0] != "/etc/verity.d" || d[3] != "/usr/lib/verity.d" || len(d) != 4 {
+		t.Errorf("TrustDirs(/) = %v", d)
+	}
 }
 
-func TestReadVeritySigBlobFromPaddedFile(t *testing.T) {
-	// readVeritySigBlob + parseVeritySig over a synthetic NUL-padded
-	// "partition" stored in a regular file.
-	raw, err := json.Marshal(&veritySig{RootHash: testRootHash, Signature: "c2ln"})
-	if err != nil {
-		t.Fatal(err)
+func TestVerifySignatureIgnoresHiddenAnchors(t *testing.T) {
+	signer := validIdentity(t, "signer", nil)
+	root := t.TempDir()
+	writeCertPEM(t, filepath.Join(root, "etc/verity.d/.revoked.crt"), signer.cert)
+	writeCertPEM(t, filepath.Join(root, "etc/verity.d/vendor.crt~"), signer.cert)
+	ok, reason, err := verifySignature(testRootHash, sign(t, testRootHash, signer, signOpts{}), TrustDirs(root))
+	if ok || err != nil || !strings.Contains(reason, "no trusted certificates") {
+		t.Errorf("signature by a hidden anchor: ok=%v reason=%q err=%v", ok, reason, err)
 	}
-	padded := make([]byte, 8192)
-	copy(padded, raw)
+}
 
-	path := filepath.Join(t.TempDir(), "sigpart")
-	if err := os.WriteFile(path, padded, 0o644); err != nil {
+func TestVerifySignatureAnchorPrecedence(t *testing.T) {
+	signer := validIdentity(t, "signer", nil)
+	other := validIdentity(t, "other", nil)
+	sig := sign(t, testRootHash, signer, signOpts{})
+
+	root := t.TempDir()
+	writeCertPEM(t, filepath.Join(root, "usr/lib/verity.d/vendor.crt"), signer.cert)
+	mustVerify(t, sig, TrustDirs(root), true)
+
+	writeCertPEM(t, filepath.Join(root, "etc/verity.d/vendor.crt"), other.cert)
+	mustVerify(t, sig, TrustDirs(root), false)
+
+	if err := os.Remove(filepath.Join(root, "etc/verity.d/vendor.crt")); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/null", filepath.Join(root, "etc/verity.d/vendor.crt")); err != nil {
+		t.Fatal(err)
+	}
+	mustVerify(t, sig, TrustDirs(root), false)
+}
+
+func TestParseVeritySig(t *testing.T) {
+	sig := []byte{1, 2, 3}
+	mk := func(rootHash, signature string) []byte {
+		b, _ := json.Marshal(map[string]string{"rootHash": rootHash, "signature": signature})
+		return b
+	}
+	valid := mk(hex.EncodeToString(testRootHash), base64.StdEncoding.EncodeToString(sig))
+	padded := append(bytes.Clone(valid), make([]byte, 4096-len(valid))...)
+
+	got, err := parseVeritySig(padded)
+	if err != nil || !bytes.Equal(got.RootHash, testRootHash) || !bytes.Equal(got.Signature, sig) {
+		t.Fatalf("padded blob: %+v, %v", got, err)
+	}
+	upper := mk(strings.ToUpper(hex.EncodeToString(testRootHash)), " AQID\n")
+	if got, err := parseVeritySig(upper); err != nil || !bytes.Equal(got.RootHash, testRootHash) || !bytes.Equal(got.Signature, sig) {
+		t.Errorf("uppercase hex / whitespace base64: %+v, %v", got, err)
 	}
 
-	blob, err := readVeritySigBlob(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(blob) != 8192 {
-		t.Fatalf("blob length %d, want 8192", len(blob))
-	}
-	sig, err := parseVeritySig(blob)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sig.RootHash != testRootHash {
-		t.Fatalf("rootHash = %q, want %q", sig.RootHash, testRootHash)
+	for name, blob := range map[string][]byte{
+		"embedded NUL":      append(append(bytes.Clone(valid), 0), 'x'),
+		"missing rootHash":  []byte(`{"signature":"AQID"}`),
+		"missing signature": []byte(`{"rootHash":"00"}`),
+		"bad hex":           mk("zz", "AQID"),
+		"bad base64":        mk("00", "!!!"),
+		"not JSON":          []byte("not json"),
+		"rootHash number":   []byte(`{"rootHash":1,"signature":"AQID"}`),
+		"too large":         make([]byte, maxVeritySigSize+1),
+	} {
+		if _, err := parseVeritySig(blob); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }

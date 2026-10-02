@@ -2,386 +2,395 @@ package image
 
 import (
 	"fmt"
-	"sort"
 	"strings"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/itxaka/sysext-alpine/internal/errno"
+	"github.com/itxaka/sysext-alpine/internal/release"
 )
 
-// This file implements the systemd.image-policy(7) grammar (see
-// docs/reference/systemd.image-policy.7.txt, dumped from systemd 260) for
-// sysext/confext DDIs.
+// This file implements systemd.image-policy(7) (see
+// docs/reference/systemd.image-policy.7.txt) with the semantics of systemd
+// v262 src/shared/image-policy.c:
 //
-// Grammar:
+//	policy     := "*" | "-" | "~" | rule (':' rule)*
+//	rule       := designator? '=' flags
+//	flags      := "-" | flag ('+' flag)*
+//	flag       := verity | signed | encrypted | encryptedwithintegrity |
+//	              unprotected | unused | absent | open | ignore |
+//	              read-only-on | read-only-off | growfs-on | growfs-off |
+//	              btrfs | erofs | ext4 | f2fs | squashfs | vfat | xfs
 //
-//	policy       := special | rule (':' rule)*
-//	special      := "" | "*" | "-" | "~"
-//	rule         := designator? '=' flags?
-//	flags        := flag ('+' flag)*
-//	flag         := protection | shortcut | fstype | gptflag
-//	designator   := "root" | "usr" | "home" | "srv" | "esp" | "xbootldr" |
-//	                "swap" | "root-verity" | "root-verity-sig" |
-//	                "usr-verity" | "usr-verity-sig" | "tmp" | "var"
-//	protection   := "verity" | "signed" | "encrypted" |
-//	                "encryptedwithintegrity" | "unprotected" | "unused" |
-//	                "absent"
-//	shortcut     := "open" | "ignore"
-//	fstype       := "btrfs" | "erofs" | "ext4" | "f2fs" | "squashfs" |
-//	                "vfat" | "xfs"
-//	gptflag      := "read-only-on" | "read-only-off" |
-//	                "growfs-on" | "growfs-off"
+// The empty designator sets the default for unlisted designators, which is
+// otherwise "ignore". Rules for verity and signature partitions that are not
+// listed explicitly are derived from their data partition's rule.
 //
-// Semantics, per the man page (verified against systemd-analyze
-// image-policy from systemd 260):
-//
-//   - An empty designator ("=flags") sets the default policy for
-//     designators not explicitly listed. There is no "default=" spelling.
-//   - Designators listed without any protection flag (e.g. "root=" or
-//     "root=erofs") get the "open" protection set (everything allowed).
-//   - Designators not listed, with no "=" default rule, fall back to
-//     "unused+absent" (i.e. the partition may exist but must not be used).
-//   - "open"  = verity+signed+encrypted+encryptedwithintegrity+
-//     unprotected+unused+absent; "ignore" = unused+absent.
-//   - Whole-policy specials: "*" = "=open" (use everything),
-//     "-" = "=unused+absent" (use nothing), "~" = "=absent"
-//     (everything must be absent). A bare flag list without "=" (e.g.
-//     just "verity") is invalid, as is "default=...".
-//   - Filesystem-type flags restrict the allowed filesystem of the
-//     partition; no fstype flag means all types are allowed.
-//   - read-only-on/-off and growfs-on/-off dictate GPT partition flag
-//     state; setting neither (or both) of a pair leaves it undictated.
-//   - Duplicate rules for the same designator are an error; duplicate
-//     flags within one rule are fine. Flag/designator names are
-//     case-sensitive; whitespace around rules, designators and flags is
-//     tolerated (matching systemd's word extraction).
-//
-// Enforcement scope: sysext DDIs only carry root/usr payloads, so
-// enforcement consults the "root" and "usr" designators (protection level
-// and filesystem type). Rules for all other designators parse and are
-// retained in imagePolicy.rules, but are not enforced.
-//
-// Deliberate divergences from systemd:
-//
-//   - The empty policy string "" is this class's default and allows
-//     everything (systemd parses "" like "-", i.e. "use nothing"). Pass
-//     "-" explicitly for systemd's deny-by-default behavior.
-//   - "encryptedwithintegrity" is accepted because systemd 260's parser
-//     accepts it, although the man page's flag list omits it. Like
-//     "encrypted" it is never satisfiable here (no LUKS support).
-//   - read-only-on/-off and growfs-on/-off parse and are retained but are
-//     not enforced: our GPT parser does not read partition attribute
-//     flags, and images are always mounted read-only and never grown.
+// The empty policy string selects the class default (systemd's
+// image_policy_sysext / image_policy_confext). systemd parses an explicit
+// empty string like "-"; callers wanting that pass "-".
 
-// protection is a partition policy flag dictating existence/use/protection.
-type protection string
+// policyFlags is systemd's PartitionPolicyFlags bit set.
+type policyFlags uint32
 
 const (
-	// protAbsent: the partition shall not exist on the image.
-	protAbsent protection = "absent"
-	// protUnused: the partition may exist but shall not be used.
-	protUnused protection = "unused"
-	// protUnprotected: data partition without verity or LUKS.
-	protUnprotected protection = "unprotected"
-	// protVerity: data partition with a matching dm-verity partition.
-	protVerity protection = "verity"
-	// protSigned: verity plus a verity-signature partition.
-	protSigned protection = "signed"
-	// protEncrypted: LUKS — recognized in policies but never satisfiable
-	// (LUKS images are unsupported).
-	protEncrypted protection = "encrypted"
-	// protEncryptedWithIntegrity: LUKS with dm-integrity — like
-	// protEncrypted, recognized but never satisfiable.
-	protEncryptedWithIntegrity protection = "encryptedwithintegrity"
+	polVerity policyFlags = 1 << iota
+	polSigned
+	polEncrypted
+	polEncryptedWithIntegrity
+	polUnprotected
+	polUnused
+	polAbsent
+	polReadOnlyOff
+	polReadOnlyOn
+	polGrowFSOff
+	polGrowFSOn
+	polBtrfs
+	polErofs
+	polExt4
+	polF2FS
+	polSquashfs
+	polVfat
+	polXFS
+
+	polOpen   = polVerity | polSigned | polEncrypted | polEncryptedWithIntegrity | polUnprotected | polUnused | polAbsent
+	polIgnore = polUnused | polAbsent
+
+	polUseMask      = polOpen
+	polReadOnlyMask = polReadOnlyOff | polReadOnlyOn
+	polGrowFSMask   = polGrowFSOff | polGrowFSOn
+	polPFlagsMask   = polReadOnlyMask | polGrowFSMask
+	polFSTypeMask   = polBtrfs | polErofs | polExt4 | polF2FS | polSquashfs | polVfat | polXFS
 )
 
-// protectionSet is the set of protection levels a policy accepts for one
-// designator.
-type protectionSet map[protection]bool
+var policyFlagNames = []struct {
+	flag policyFlags
+	name string
+}{
+	{polVerity, "verity"},
+	{polSigned, "signed"},
+	{polEncrypted, "encrypted"},
+	{polEncryptedWithIntegrity, "encryptedwithintegrity"},
+	{polUnprotected, "unprotected"},
+	{polUnused, "unused"},
+	{polAbsent, "absent"},
+	{polReadOnlyOn, "read-only-on"},
+	{polReadOnlyOff, "read-only-off"},
+	{polGrowFSOn, "growfs-on"},
+	{polGrowFSOff, "growfs-off"},
+	{polBtrfs, "btrfs"},
+	{polErofs, "erofs"},
+	{polExt4, "ext4"},
+	{polF2FS, "f2fs"},
+	{polSquashfs, "squashfs"},
+	{polVfat, "vfat"},
+	{polXFS, "xfs"},
+}
 
-// openProtections is the "open" shortcut set: everything allowed.
-func openProtections() protectionSet {
-	return protectionSet{
-		protAbsent:                 true,
-		protUnused:                 true,
-		protUnprotected:            true,
-		protVerity:                 true,
-		protSigned:                 true,
-		protEncrypted:              true,
-		protEncryptedWithIntegrity: true,
+func policyFlagFromString(s string) (policyFlags, bool) {
+	switch s {
+	case "open":
+		return polOpen, true
+	case "ignore":
+		return polIgnore, true
 	}
-}
-
-// ignoreProtections is the "ignore" shortcut set ("unused+absent"), also
-// the fallback for designators that are neither listed nor covered by a
-// default rule.
-func ignoreProtections() protectionSet {
-	return protectionSet{protUnused: true, protAbsent: true}
-}
-
-// allProtections is the class-default set used for the empty policy
-// string: everything allowed (identical to "open").
-func allProtections() protectionSet { return openProtections() }
-
-// validDesignators are the partition identifiers the man page defines.
-var validDesignators = map[string]bool{
-	"root": true, "usr": true, "home": true, "srv": true, "esp": true,
-	"xbootldr": true, "swap": true, "root-verity": true,
-	"root-verity-sig": true, "usr-verity": true, "usr-verity-sig": true,
-	"tmp": true, "var": true,
-}
-
-// validFSTypes are the filesystem policy flags the man page defines.
-var validFSTypes = map[string]bool{
-	"btrfs": true, "erofs": true, "ext4": true, "f2fs": true,
-	"squashfs": true, "vfat": true, "xfs": true,
-}
-
-// partitionRule is the parsed policy for one designator (or the default).
-type partitionRule struct {
-	// protections is never empty: a rule listing no protection flag gets
-	// the "open" set, per the man page.
-	protections protectionSet
-	// fs restricts the allowed filesystem types; nil = all allowed.
-	fs map[string]bool
-	// readOnly/growfs dictate GPT partition flag state; nil = undictated
-	// (neither or both of the on/off pair was given). Retained but not
-	// enforced — see the divergence notes above.
-	readOnly *bool
-	growfs   *bool
-}
-
-// imagePolicy is a parsed image policy.
-type imagePolicy struct {
-	// rules maps explicitly listed designators to their policy.
-	rules map[string]*partitionRule
-	// def is the empty-designator default rule, nil when not given.
-	def *partitionRule
-	// allowAll marks the class default (empty policy string): everything
-	// is allowed for every designator.
-	allowAll bool
-}
-
-// ruleFor resolves the effective rule for a designator: explicit rule,
-// else the default rule, else nil (the man page "unused+absent" fallback).
-func (p *imagePolicy) ruleFor(d string) *partitionRule {
-	if r, ok := p.rules[d]; ok {
-		return r
-	}
-	return p.def
-}
-
-// forDesignator returns the allowed protection set for a designator
-// (enforcement uses "root" and "usr" only).
-func (p *imagePolicy) forDesignator(d string) protectionSet {
-	if p.allowAll {
-		return allProtections()
-	}
-	if r := p.ruleFor(d); r != nil {
-		return r.protections
-	}
-	return ignoreProtections()
-}
-
-// checkFS enforces the filesystem-type policy flags for a designator
-// against the detected payload filesystem.
-func (p *imagePolicy) checkFS(designator string, fs FSType) error {
-	if p.allowAll {
-		return nil
-	}
-	r := p.ruleFor(designator)
-	if r == nil || r.fs == nil || r.fs[string(fs)] {
-		return nil
-	}
-	names := make([]string, 0, len(r.fs))
-	for n := range r.fs {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	return fmt.Errorf("image does not satisfy image policy: %s partition filesystem is %s, policy allows %s",
-		designator, fs, strings.Join(names, "+"))
-}
-
-// parseImagePolicy parses a systemd.image-policy(7) string (see the file
-// comment for grammar, semantics and divergences). The empty string is the
-// class default: everything allowed for every designator.
-func parseImagePolicy(s string) (*imagePolicy, error) {
-	pol := &imagePolicy{rules: make(map[string]*partitionRule)}
-
-	switch strings.TrimSpace(s) {
-	case "":
-		if s == "" {
-			pol.allowAll = true
-			return pol, nil
+	for _, f := range policyFlagNames {
+		if f.name == s {
+			return f.flag, true
 		}
-		return nil, fmt.Errorf("invalid image policy %q", s)
-	case "*": // "use everything"
-		s = "=verity+signed+encrypted+encryptedwithintegrity+unprotected+unused+absent"
-	case "-": // "use nothing"
-		s = "=unused+absent"
-	case "~": // "everything must be absent"
-		s = "=absent"
 	}
+	return 0, false
+}
 
-	for _, comp := range strings.Split(s, ":") {
-		comp = strings.TrimSpace(comp)
-		if comp == "" {
-			return nil, fmt.Errorf("invalid image policy: empty rule (leading, trailing or doubled %q)", ":")
-		}
-
-		designator, flags, ok := strings.Cut(comp, "=")
-		if !ok {
-			return nil, fmt.Errorf("invalid image policy rule %q (want [designator]=[flag[+flag...]])", comp)
-		}
-		designator = strings.TrimSpace(designator)
-		if designator != "" && !validDesignators[designator] {
-			return nil, fmt.Errorf("unknown partition designator %q in image policy rule %q", designator, comp)
-		}
-
-		rule, err := parsePartitionRule(flags, comp)
-		if err != nil {
-			return nil, err
-		}
-
-		if designator == "" {
-			if pol.def != nil {
-				return nil, fmt.Errorf("duplicate default rule in image policy (rule %q)", comp)
+// String renders the flags like systemd's partition_policy_flags_to_string()
+// with simplify=true.
+func (f policyFlags) String() string {
+	var l []string
+	switch f & polUseMask {
+	case polOpen:
+		l = append(l, "open")
+	case polIgnore:
+		l = append(l, "ignore")
+	default:
+		for _, n := range policyFlagNames[:7] {
+			if f&n.flag != 0 {
+				l = append(l, n.name)
 			}
-			pol.def = rule
+		}
+	}
+	if (f&polReadOnlyOn == 0) != (f&polReadOnlyOff == 0) {
+		if f&polReadOnlyOn != 0 {
+			l = append(l, "read-only-on")
+		} else {
+			l = append(l, "read-only-off")
+		}
+	}
+	if (f&polGrowFSOn == 0) != (f&polGrowFSOff == 0) {
+		if f&polGrowFSOn != 0 {
+			l = append(l, "growfs-on")
+		} else {
+			l = append(l, "growfs-off")
+		}
+	}
+	for _, n := range policyFlagNames[11:] {
+		if f&n.flag != 0 {
+			l = append(l, n.name)
+		}
+	}
+	if len(l) == 0 {
+		return "-"
+	}
+	return strings.Join(l, "+")
+}
+
+// imagePolicy is a parsed image policy (systemd's ImagePolicy).
+type imagePolicy struct {
+	rules map[designator]policyFlags
+	def   policyFlags
+}
+
+const classPolicyProtection = polVerity | polSigned | polEncrypted | polEncryptedWithIntegrity | polUnprotected | polAbsent
+
+// classDefaultPolicy returns image_policy_sysext or image_policy_confext.
+func classDefaultPolicy(class release.Class) *imagePolicy {
+	p := &imagePolicy{rules: map[designator]policyFlags{partRoot: classPolicyProtection}, def: polIgnore}
+	if class != release.Confext {
+		p.rules[partUsr] = classPolicyProtection
+	}
+	return p
+}
+
+// resolvePolicy parses s, or returns the class default for the empty string.
+func resolvePolicy(s string, class release.Class) (*imagePolicy, error) {
+	if s == "" {
+		return classDefaultPolicy(class), nil
+	}
+	return parseImagePolicy(s)
+}
+
+// ValidatePolicy reports whether s is a valid systemd.image-policy(7)
+// string, like image_policy_from_string() with graceful=false. The empty
+// string (the class default) is valid. Errors wrap unix.ENOTUNIQ (duplicate
+// rule), unix.EBADSLT (unknown partition designator), unix.EBADRQC (unknown
+// policy flag) or unix.EINVAL.
+func ValidatePolicy(s string) error {
+	if s == "" {
+		return nil
+	}
+	_, err := parseImagePolicy(s)
+	return err
+}
+
+// NormalizePolicy parses s like image_policy_from_string() with
+// graceful=true, as configuration files are parsed: unknown partition
+// designators and policy flags are dropped. It returns the policy in a form
+// the strict parser accepts; "" stays "".
+func NormalizePolicy(s string) (string, error) {
+	if s == "" {
+		return "", nil
+	}
+	pol, err := parsePolicy(s, true)
+	if err != nil {
+		return "", err
+	}
+	rules := []string{"=" + pol.def.String()}
+	for d := range numDesignators {
+		if f, ok := pol.rules[d]; ok {
+			rules = append(rules, d.String()+"="+f.String())
+		}
+	}
+	return strings.Join(rules, ":"), nil
+}
+
+// parseImagePolicy mirrors systemd's image_policy_from_string() with
+// graceful=false.
+func parseImagePolicy(s string) (*imagePolicy, error) {
+	return parsePolicy(s, false)
+}
+
+func parsePolicy(s string, graceful bool) (*imagePolicy, error) {
+	pol := &imagePolicy{rules: make(map[designator]policyFlags), def: polIgnore}
+	switch s {
+	case "", "-":
+		return pol, nil
+	case "*":
+		pol.def = polOpen
+		return pol, nil
+	case "~":
+		pol.def = polAbsent
+		return pol, nil
+	}
+
+	defaultSet := false
+	for rule := range strings.SplitSeq(s, ":") {
+		name, flags, ok := strings.Cut(rule, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid image policy %q: missing '=' in %q: %w", s, rule, unix.EINVAL)
+		}
+		name = strings.TrimSpace(name)
+		var d designator
+		if name != "" {
+			if d, ok = designatorFromString(name); !ok {
+				if graceful {
+					continue
+				}
+				return nil, fmt.Errorf("invalid image policy %q: unknown partition designator %q: %w", s, name, unix.EBADSLT)
+			}
+			if _, dup := pol.rules[d]; dup {
+				return nil, fmt.Errorf("invalid image policy %q: partition designator %q specified more than once: %w", s, name, unix.ENOTUNIQ)
+			}
+		} else if defaultSet {
+			return nil, fmt.Errorf("invalid image policy %q: default partition policy specified more than once: %w", s, unix.ENOTUNIQ)
+		}
+		f, err := parsePolicyFlags(strings.TrimSpace(flags), graceful)
+		if err != nil {
+			return nil, fmt.Errorf("invalid image policy %q: %w", s, err)
+		}
+		if name == "" {
+			defaultSet = true
+			pol.def = f
 			continue
 		}
-		if _, dup := pol.rules[designator]; dup {
-			return nil, fmt.Errorf("duplicate rule for designator %q in image policy", designator)
-		}
-		pol.rules[designator] = rule
+		pol.rules[d] = f
 	}
 	return pol, nil
 }
 
-// parsePartitionRule parses the flag list of one rule and normalizes it:
-// no protection flags ⇒ "open"; neither/both of an on/off GPT-flag pair ⇒
-// undictated.
-func parsePartitionRule(flags, comp string) (*partitionRule, error) {
-	rule := &partitionRule{protections: make(protectionSet)}
-	var roOn, roOff, gfOn, gfOff bool
-
-	if flags != "" {
-		for _, f := range strings.Split(flags, "+") {
-			f = strings.TrimSpace(f)
-			switch {
-			case f == "":
-				return nil, fmt.Errorf("empty flag in image policy rule %q", comp)
-			case f == string(protAbsent), f == string(protUnused),
-				f == string(protUnprotected), f == string(protVerity),
-				f == string(protSigned), f == string(protEncrypted),
-				f == string(protEncryptedWithIntegrity):
-				rule.protections[protection(f)] = true
-			case f == "open":
-				for p := range openProtections() {
-					rule.protections[p] = true
-				}
-			case f == "ignore":
-				for p := range ignoreProtections() {
-					rule.protections[p] = true
-				}
-			case validFSTypes[f]:
-				if rule.fs == nil {
-					rule.fs = make(map[string]bool)
-				}
-				rule.fs[f] = true
-			case f == "read-only-on":
-				roOn = true
-			case f == "read-only-off":
-				roOff = true
-			case f == "growfs-on":
-				gfOn = true
-			case f == "growfs-off":
-				gfOff = true
-			default:
-				return nil, fmt.Errorf("invalid flag %q in image policy rule %q", f, comp)
+func parsePolicyFlags(s string, graceful bool) (policyFlags, error) {
+	if s == "" || s == "-" {
+		return 0, nil
+	}
+	var flags policyFlags
+	for w := range strings.SplitSeq(s, "+") {
+		f, ok := policyFlagFromString(strings.TrimSpace(w))
+		if !ok {
+			if graceful {
+				continue
 			}
+			return 0, fmt.Errorf("unknown partition policy flag %q: %w", w, unix.EBADRQC)
 		}
+		flags |= f
 	}
-
-	// "if none of the [protection] flags are set for a listed partition
-	// identifier, the default policy of open is implied".
-	if len(rule.protections) == 0 {
-		rule.protections = openProtections()
-	}
-	// "Setting neither flag is equivalent to setting both."
-	if roOn != roOff {
-		rule.readOnly = &roOn
-	}
-	if gfOn != gfOff {
-		rule.growfs = &gfOn
-	}
-	return rule, nil
+	return flags, nil
 }
 
-// classifyProtection determines the actual protection level the image
-// offers for one designator, from its partition list:
-//
-//	absent       — no data partition of the designator's type
-//	unprotected  — data partition, but no usable verity partition
-//	verity       — data + verity partition (with non-zero unique GUIDs)
-//	signed       — data + verity + verity-signature partition
-//
-// A verity partition whose unique GUID (or whose data partition's unique
-// GUID) is all-zero cannot convey a root hash and is treated as missing
-// (the spec's root-hash discovery needs both halves).
-func classifyProtection(parts []gptPartition, guids dpsGUIDs, designator string) protection {
-	dataType, verityType, sigType := guids.root, guids.rootVerity, guids.rootVeritySig
-	if designator == "usr" {
-		dataType, verityType, sigType = guids.usr, guids.usrVerity, guids.usrVeritySig
+// extendPolicyFlags fills unspecified aspects with "don't care"
+// (partition_policy_flags_extend).
+func extendPolicyFlags(f policyFlags) policyFlags {
+	if f&polUseMask == 0 {
+		f |= polOpen
 	}
-
-	data := findByType(parts, dataType)
-	if data == nil {
-		return protAbsent
+	if f&polReadOnlyMask == 0 {
+		f |= polReadOnlyMask
 	}
-	verity := findByType(parts, verityType)
-	if verity == nil || !verityUsable(*data, *verity) {
-		return protUnprotected
+	if f&polGrowFSMask == 0 {
+		f |= polGrowFSMask
 	}
-	if findByType(parts, sigType) != nil {
-		return protSigned
-	}
-	return protVerity
+	return f
 }
 
-// findByType returns the first partition with the given type GUID, or nil.
-func findByType(parts []gptPartition, typeGUID string) *gptPartition {
-	for i := range parts {
-		if parts[i].TypeGUID == typeGUID {
-			return &parts[i]
-		}
+// normalizePolicyFlags mirrors partition_policy_normalized_flags().
+func normalizePolicyFlags(f policyFlags, d designator) policyFlags {
+	f = extendPolicyFlags(f)
+	if d.verityData() != partInvalid {
+		f &^= polVerity | polSigned | polEncrypted | polEncryptedWithIntegrity
+	}
+	if d.verityHash() == partInvalid {
+		f &^= polVerity | polSigned
+	}
+	if f&polUseMask == polAbsent {
+		f &^= polPFlagsMask
+	}
+	return f
+}
+
+// get mirrors image_policy_get(): the explicit rule, or one derived from the
+// data partition for verity/signature designators; ok=false when neither.
+func (p *imagePolicy) get(d designator) (policyFlags, bool) {
+	if f, ok := p.rules[d]; ok {
+		return normalizePolicyFlags(f, d), true
+	}
+	data := d.verityData()
+	if data == partInvalid {
+		return 0, false
+	}
+	df, ok := p.get(data)
+	if !ok {
+		return 0, false
+	}
+	need := polVerity | polSigned
+	if d.isVeritySig() {
+		need = polSigned
+	}
+	if df&need == 0 {
+		return 0, false
+	}
+	return normalizePolicyFlags(polUnprotected|df&(polUnused|polAbsent)|df&polPFlagsMask, d), true
+}
+
+// exhaustive mirrors image_policy_get_exhaustively().
+func (p *imagePolicy) exhaustive(d designator) policyFlags {
+	if f, ok := p.get(d); ok {
+		return f
+	}
+	return normalizePolicyFlags(p.def, d)
+}
+
+// mayUse mirrors image_policy_may_use(): an error when the partition must be
+// absent, false when it shall be ignored.
+func (p *imagePolicy) mayUse(d designator) (bool, error) {
+	f := p.exhaustive(d) & polUseMask
+	if f == polAbsent {
+		return false, errno.New(unix.ERFKILL, "image does not satisfy image policy: %s partition exists, but the policy requires it to be absent", d)
+	}
+	if f&^polAbsent == polUnused {
+		return false, nil
+	}
+	return true, nil
+}
+
+// checkProtection mirrors image_policy_check_protection().
+func (p *imagePolicy) checkProtection(d designator, found policyFlags) error {
+	want := p.exhaustive(d)
+	if found&want != 0 {
+		return nil
+	}
+	hint := ""
+	if want&polUseMask&^(polEncrypted|polEncryptedWithIntegrity) == 0 && want&(polEncrypted|polEncryptedWithIntegrity) != 0 {
+		hint = " (encrypted images are not supported)"
+	}
+	return errno.New(unix.ERFKILL, "image does not satisfy image policy: %s partition is %s, but policy requires %s%s",
+		d, found&polUseMask, want&polUseMask, hint)
+}
+
+// checkPartitionFlags mirrors image_policy_check_partition_flags().
+func (p *imagePolicy) checkPartitionFlags(d designator, attrs uint64) error {
+	want := p.exhaustive(d)
+	if ro := attrs&gptFlagReadOnly != 0; want&polReadOnlyMask == pick(ro, polReadOnlyOff, polReadOnlyOn) {
+		return errno.New(unix.ERFKILL, "image does not satisfy image policy: %s partition has the read-only flag incorrectly %s", d, pick(ro, "set", "unset"))
+	}
+	if grow := attrs&gptFlagGrowFS != 0; want&polGrowFSMask == pick(grow, polGrowFSOff, polGrowFSOn) {
+		return errno.New(unix.ERFKILL, "image does not satisfy image policy: %s partition has the growfs flag incorrectly %s", d, pick(grow, "set", "unset"))
 	}
 	return nil
 }
 
-// zeroGUID is the canonical form of the all-zero GUID.
-const zeroGUID = "00000000-0000-0000-0000-000000000000"
-
-// verityUsable reports whether the data/verity partition pair can convey a
-// verity root hash via their unique partition GUIDs.
-func verityUsable(data, verity gptPartition) bool {
-	return data.UniqueGUID != zeroGUID && verity.UniqueGUID != zeroGUID &&
-		data.UniqueGUID != "" && verity.UniqueGUID != ""
+func pick[T any](cond bool, a, b T) T {
+	if cond {
+		return a
+	}
+	return b
 }
 
-// policyError is the canonical policy rejection error text (matches what
-// the task spec and systemd's messages convey).
-func policyError(designator string, actual protection, allowed protectionSet) error {
-	var names []string
-	for _, p := range []protection{
-		protVerity, protSigned, protEncrypted, protEncryptedWithIntegrity,
-		protUnprotected, protUnused, protAbsent,
-	} {
-		if allowed[p] {
-			names = append(names, string(p))
-		}
+// checkFS enforces the filesystem type flags of a designator: when any are
+// given, the detected filesystem must be one of them.
+func (p *imagePolicy) checkFS(d designator, fs fsType) error {
+	want := p.exhaustive(d) & polFSTypeMask
+	if want == 0 {
+		return nil
 	}
-	hint := ""
-	if allowed[protEncrypted] || allowed[protEncryptedWithIntegrity] {
-		hint = " (note: encrypted/LUKS images are not supported)"
+	if f, ok := policyFlagFromString(string(fs)); ok && want&f != 0 {
+		return nil
 	}
-	return fmt.Errorf("image does not satisfy image policy: %s partition is %s, policy allows %s%s",
-		designator, actual, strings.Join(names, "+"), hint)
+	return errno.New(unix.ERFKILL, "image does not satisfy image policy: %s partition filesystem is %s, policy allows %s", d, fs, want)
 }

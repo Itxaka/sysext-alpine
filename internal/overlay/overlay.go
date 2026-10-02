@@ -1,728 +1,427 @@
-// Package overlay assembles, mounts and dismantles the merged overlayfs
-// hierarchies and the /run/systemd/{sysext,confext} workspace, mirroring
-// systemd's runtime layout per docs/SPEC.md §4-5.
+// Package overlay merges extension images into their hierarchies the way
+// systemd-sysext 262 does: one read-only (or mutable) overlayfs per
+// hierarchy, whose top layer carries the .systemd-sysext (.systemd-confext)
+// metadata directory, with mounts below the hierarchy carried over.
+//
+// Image mounts and overlay layers live in a private tmpfs workspace below
+// /run/systemd that stays mounted while extensions are merged.
 package overlay
 
 import (
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
-	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/itxaka/sysext-alpine/internal/discover"
-	"github.com/itxaka/sysext-alpine/internal/image"
+	"github.com/itxaka/sysext-alpine/internal/fsutil"
 	"github.com/itxaka/sysext-alpine/internal/release"
 )
 
-// ErrAlreadyMerged is returned by Merge when a hierarchy is already merged.
+// ErrAlreadyMerged is matched by the error Merge returns when a hierarchy is
+// already merged.
 var ErrAlreadyMerged = errors.New("already merged")
 
-// Environment variables overriding the default merge hierarchies, matching
-// systemd-sysext/systemd-confext: a colon-separated list of absolute paths.
+// ErrCleanup is matched by the error Merge and Refresh return when the
+// extensions were merged, but what the merge left behind or replaced in the
+// workspace could not be cleaned up; the Outcome describes the merge.
+var ErrCleanup = errors.New("extensions merged, but failed to clean up")
+
+// AlreadyMergedError names the hierarchy found merged.
+type AlreadyMergedError struct {
+	Hierarchy string
+}
+
+func (e *AlreadyMergedError) Error() string {
+	return fmt.Sprintf("Hierarchy '%s' is already merged.", e.Hierarchy)
+}
+
+// Is makes errors.Is(err, ErrAlreadyMerged) hold.
+func (e *AlreadyMergedError) Is(target error) bool { return target == ErrAlreadyMerged }
+
+// runtimeDir holds the workspaces and lock files.
+var runtimeDir = "/run/systemd"
+
+// Hierarchies returns the merge targets of the class: /usr and /opt for
+// sysext, /etc for confext, or the colon-separated list of absolute,
+// normalized paths in $SYSTEMD_SYSEXT_HIERARCHIES ($SYSTEMD_CONFEXT_HIERARCHIES)
+// when set. An invalid list is an error, like in systemd.
+func Hierarchies(class release.Class) ([]string, error) {
+	env, def := "SYSTEMD_SYSEXT_HIERARCHIES", []string{"/usr", "/opt"}
+	if class == release.Confext {
+		env, def = "SYSTEMD_CONFEXT_HIERARCHIES", []string{"/etc"}
+	}
+	value, ok := os.LookupEnv(env)
+	if !ok {
+		return def, nil
+	}
+	list, err := parseHierarchies(value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine %s hierarchies: $%s: %w", classIdentifier(class), env, err)
+	}
+	return list, nil
+}
+
+// parseHierarchies is getenv_path_list().
+func parseHierarchies(value string) ([]string, error) {
+	var list []string
+	if value != "" {
+		for _, p := range splitColon(value) {
+			switch {
+			case !filepath.IsAbs(p):
+				return nil, fmt.Errorf("path '%s' is not absolute, refusing: %w", p, unix.EINVAL)
+			case !pathIsNormalized(p):
+				return nil, fmt.Errorf("path '%s' is not normalized, refusing: %w", p, unix.EINVAL)
+			case filepath.Clean(p) == "/":
+				return nil, fmt.Errorf("path '%s' is the root fs, refusing: %w", p, unix.EINVAL)
+			}
+			list = append(list, p)
+		}
+	}
+	if len(list) == 0 {
+		return nil, fmt.Errorf("no paths specified, refusing: %w", unix.EINVAL)
+	}
+	return list, nil
+}
+
+func splitColon(s string) []string {
+	var out []string
+	for {
+		i := 0
+		for i < len(s) && s[i] != ':' {
+			i++
+		}
+		out = append(out, s[:i])
+		if i == len(s) {
+			return out
+		}
+		s = s[i+1:]
+	}
+}
+
+// resolveRoot resolves --root like systemd's chase(root, NULL,
+// CHASE_MUST_BE_DIRECTORY); "" is the host root.
+func resolveRoot(root string) (string, error) {
+	if root == "" || root == "/" {
+		return "/", nil
+	}
+	abs, err := filepath.Abs(root)
+	if err == nil {
+		abs, err = filepath.EvalSymlinks(abs)
+	}
+	if err == nil {
+		err = mustBeDir(abs)
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve --root='%s': %w", root, err)
+	}
+	return abs, nil
+}
+
+// workspaceFor returns the workspace of class for a resolved root. Merges
+// into a foreign root keep their workspace on the host as well, never inside
+// the root, in a directory named after the root.
+func workspaceFor(class release.Class, root string) string {
+	name := classIdentifier(class)
+	if root != "/" {
+		sum := sha256.Sum256([]byte(root))
+		name += "." + hex.EncodeToString(sum[:8])
+	}
+	return filepath.Join(runtimeDir, name)
+}
+
+// Workspace returns the directory below which the images merged into root
+// are mounted, at extensions/<name>.
+func Workspace(class release.Class, root string) (string, error) {
+	r, err := resolveRoot(root)
+	if err != nil {
+		return "", err
+	}
+	return workspaceFor(class, r), nil
+}
+
+// resolveHierarchy is chase(hierarchy, root, CHASE_PREFIX_ROOT): "" when the
+// hierarchy does not exist.
+func resolveHierarchy(root, hierarchy string) (string, error) {
+	p, err := fsutil.Chase(root, hierarchy, 0)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve path to hierarchy '%s': %w", hierarchy, err)
+	}
+	return p, nil
+}
+
+// IsMergedByUs reports whether hierarchy, resolved inside root, is an
+// overlay set up by a merge: a mount point whose metadata dev marker
+// matches it.
+func IsMergedByUs(class release.Class, root, hierarchy string) (bool, error) {
+	r, err := resolveRoot(root)
+	if err != nil {
+		return false, err
+	}
+	p, err := resolveHierarchy(r, hierarchy)
+	if err != nil || p == "" {
+		return false, err
+	}
+	return isOurMountPoint(class, p)
+}
+
+// Status describes the merge state of one hierarchy.
+type Status struct {
+	Hierarchy  string
+	Merged     bool
+	Extensions []string // merged extension names, in merge order
+	Since      int64    // mtime of the merged hierarchy in µs; 0 if unmerged
+}
+
+// CurrentStatus reports the state of every existing hierarchy of the class,
+// like systemd-sysext status. Hierarchies that cannot be inspected are
+// reported in the error and left out.
+func CurrentStatus(class release.Class, root string) ([]Status, error) {
+	hierarchies, err := Hierarchies(class)
+	if err != nil {
+		return nil, err
+	}
+	r, err := resolveRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	var statuses []Status
+	var errs []error
+	for _, h := range hierarchies {
+		p, err := resolveHierarchy(r, h)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if p == "" {
+			continue
+		}
+		ours, err := isOurMountPoint(class, p)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if !ours {
+			statuses = append(statuses, Status{Hierarchy: h})
+			continue
+		}
+		f := filepath.Join(p, MarkerDirName(class), listFileName(class))
+		data, err := os.ReadFile(f)
+		if err != nil {
+			return statuses, fmt.Errorf("failed to open '%s': %w", f, err)
+		}
+		var st unix.Stat_t
+		if err := unix.Stat(p, &st); err != nil {
+			return statuses, fmt.Errorf("stat %s: %w", p, err)
+		}
+		statuses = append(statuses, Status{
+			Hierarchy:  h,
+			Merged:     true,
+			Extensions: parseList(string(data)),
+			Since:      st.Mtim.Nano() / 1_000,
+		})
+	}
+	return statuses, errors.Join(errs...)
+}
+
+// NoExec values of MergeOptions.NoExec, systemd's --noexec= tristate.
 const (
-	envSysextHierarchies  = "SYSTEMD_SYSEXT_HIERARCHIES"
-	envConfextHierarchies = "SYSTEMD_CONFEXT_HIERARCHIES"
+	NoExecDefault = -1 // the class default: exec for sysext, noexec for confext
+	NoExecOff     = 0
+	NoExecOn      = 1
 )
 
-// Hierarchies returns the merge targets for the class. Defaults are
-// Sysext: ["/usr", "/opt"]; Confext: ["/etc"]. Like systemd, the defaults can
-// be overridden via SYSTEMD_SYSEXT_HIERARCHIES / SYSTEMD_CONFEXT_HIERARCHIES,
-// a colon-separated list of absolute paths. An empty or unset variable keeps
-// the defaults; an invalid value (relative entry, uncleaned path, "/",
-// duplicate, empty entry) logs a warning to stderr and falls back to the
-// defaults entirely.
-func Hierarchies(class release.Class) []string {
-	env, def := envSysextHierarchies, []string{"/usr", "/opt"}
-	if class == release.Confext {
-		env, def = envConfextHierarchies, []string{"/etc"}
-	}
-	value := os.Getenv(env)
-	if value == "" {
-		return def
-	}
-	parsed, err := parseHierarchiesEnv(value)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q: %v\n", env, value, err)
-		return def
-	}
-	if len(parsed) == 0 {
-		return def
-	}
-	return parsed
-}
-
-// parseHierarchiesEnv parses a colon-separated hierarchy list from the
-// SYSTEMD_{SYSEXT,CONFEXT}_HIERARCHIES environment variables. Every entry
-// must be an absolute, already-cleaned path other than "/", with no
-// duplicates. An empty value parses to nil (caller falls back to defaults).
-// Pure; unit-tested.
-func parseHierarchiesEnv(value string) ([]string, error) {
-	if value == "" {
-		return nil, nil
-	}
-	seen := make(map[string]bool)
-	var hierarchies []string
-	for _, entry := range strings.Split(value, ":") {
-		if entry == "" {
-			return nil, errors.New("empty hierarchy entry")
-		}
-		if !filepath.IsAbs(entry) {
-			return nil, fmt.Errorf("hierarchy %q is not an absolute path", entry)
-		}
-		if filepath.Clean(entry) != entry {
-			return nil, fmt.Errorf("hierarchy %q is not a cleaned path", entry)
-		}
-		if entry == "/" {
-			return nil, errors.New(`hierarchy "/" is not allowed`)
-		}
-		if seen[entry] {
-			return nil, fmt.Errorf("duplicate hierarchy %q", entry)
-		}
-		seen[entry] = true
-		hierarchies = append(hierarchies, entry)
-	}
-	return hierarchies, nil
-}
-
-// Workspace returns the runtime workspace dir for the class under root:
-// /run/systemd/sysext or /run/systemd/confext. Subdirs used:
-// extensions/<name>, meta/<escaped hierarchy>, overlay/<escaped hierarchy>.
-func Workspace(class release.Class, root string) string {
-	name := "sysext"
-	if class == release.Confext {
-		name = "confext"
-	}
-	return filepath.Join(root, "/run/systemd", name)
-}
-
-// MarkerDirName returns ".systemd-sysext" or ".systemd-confext".
-func MarkerDirName(class release.Class) string {
-	if class == release.Confext {
-		return ".systemd-confext"
-	}
-	return ".systemd-sysext"
-}
-
-// Status describes one hierarchy's merge state for `status` output.
-type Status struct {
-	Hierarchy  string   `json:"hierarchy"`
-	Merged     bool     `json:"merged"`
-	Extensions []string `json:"extensions"` // names, merge order; nil if unmerged
-	Since      int64    `json:"since"`      // unix mtime of marker dir; 0 if unmerged
-}
-
-// MergeOptions tunes Merge behavior.
+// MergeOptions tune Merge and Refresh.
 type MergeOptions struct {
-	Root   string // --root; "" = real root
-	NoExec bool   // confext only; default true (apply MS_NOEXEC)
-	Force  bool   // informational; version checks happen in caller
-	Arch   string // host architecture (release.HostArchitecture())
-
-	// Mutable is the --mutable= mode: "no" (default; "" treated as "no"),
-	// "auto", "yes", "import", "ephemeral", "ephemeral-import".
-	// See docs/SPEC.md "Mutability".
+	// Root is the OS tree to merge into; "" is the host.
+	Root string
+	// Mutable is the --mutable= mode: "no" ("" means "no"), "auto",
+	// "yes", "import", "ephemeral" or "ephemeral-import".
 	Mutable string
-
-	// ImagePolicy is the systemd.image-policy(7) string applied when
-	// mounting raw disk images ("" = class default).
+	// MountOptions, when set, are the extra overlayfs mount options
+	// ($SYSTEMD_SYSEXT_OVERLAYFS_MOUNT_OPTIONS). They replace the default
+	// options of mutable overlays, also when empty; nil keeps them.
+	MountOptions *string
+	// ImagePolicy is the image policy applied to disk images; "" selects
+	// the class default.
 	ImagePolicy string
+	// Arch is the architecture partitions are picked for; "" is the
+	// running one.
+	Arch string
+	// NoExec is one of NoExecDefault, NoExecOff and NoExecOn.
+	NoExec int
+	// AlwaysRefresh makes Refresh remerge even when nothing changed.
+	AlwaysRefresh bool
+	// Check, when set, is called for every image once it is mounted, with
+	// the directory holding its tree: false ignores the image (counted in
+	// Outcome.Ignored), an error aborts the merge.
+	Check func(img discover.Image, tree string) (bool, error)
+	// Warnf, when set, receives non-fatal diagnostics.
+	Warnf func(format string, args ...any)
+	// BeforeMerge, when set, is called once the images are mounted and
+	// checked and the merge goes ahead, before any hierarchy is touched,
+	// with the names of the extensions to merge (none for a mutable merge
+	// without extensions).
+	BeforeMerge func(merged []string)
+	// BeforeUnmerge, when set, is called by Refresh right before it unmerges
+	// the class because no extension qualified, while the old merge is
+	// still in place. An error aborts the refresh, leaving the merge as it
+	// is.
+	BeforeUnmerge func() error
 }
 
-// escapeHierarchy turns a hierarchy path into a workspace directory name:
-// the leading '/' is trimmed and remaining '/' become '-'
-// (e.g. "/usr" → "usr", "/some/path" → "some-path").
-func escapeHierarchy(hierarchy string) string {
-	return strings.ReplaceAll(strings.TrimPrefix(filepath.Clean(hierarchy), "/"), "/", "-")
+// ImageError is the error of an image that could not be mounted.
+type ImageError struct {
+	Image discover.Image
+	Err   error
 }
 
-// escapeOverlayPath escapes a single lowerdir path per overlayfs mount-option
-// escaping: '\', ':' and ',' are backslash-escaped.
-func escapeOverlayPath(p string) string {
-	var b strings.Builder
-	b.Grow(len(p))
-	for i := 0; i < len(p); i++ {
-		switch p[i] {
-		case '\\', ':', ',':
-			b.WriteByte('\\')
-		}
-		b.WriteByte(p[i])
-	}
-	return b.String()
+func (e *ImageError) Error() string {
+	return "failed to mount image " + e.Image.Name + ": " + e.Err.Error()
 }
 
-// buildLowerdir joins lowerdir paths with ':' applying overlayfs escaping to
-// each component. Pure; unit-tested.
-func buildLowerdir(paths []string) string {
-	escaped := make([]string, len(paths))
-	for i, p := range paths {
-		escaped[i] = escapeOverlayPath(p)
-	}
-	return strings.Join(escaped, ":")
+func (e *ImageError) Unwrap() error { return e.Err }
+
+// Result is what Merge or Refresh did.
+type Result int
+
+const (
+	// NothingFound: no extension qualified (and no mutable mode asked for
+	// a merge anyway); nothing was merged. Refresh unmerged instead.
+	NothingFound Result = iota
+	// Merged: the hierarchies are merged now.
+	Merged
+	// Unchanged: Refresh found the merged state up to date.
+	Unchanged
+)
+
+// Outcome reports the result of Merge or Refresh.
+type Outcome struct {
+	Result Result
+	// Merged lists the merged extension names, in merge order.
+	Merged []string
+	// Ignored counts the images rejected by MergeOptions.Check.
+	Ignored int
+	// Hierarchies lists the resolved hierarchy paths merged.
+	Hierarchies []string
+	// Unmerged lists the resolved hierarchy paths whose previous merge was
+	// removed.
+	Unmerged []string
 }
 
-// overlayMountFlags returns the mount flags for the merged overlay:
-// sysext ro,nodev; confext ro,nodev,nosuid[,noexec].
-func overlayMountFlags(class release.Class, noExec bool) uintptr {
-	if class == release.Confext {
-		flags := uintptr(unix.MS_RDONLY | unix.MS_NODEV | unix.MS_NOSUID)
-		if noExec {
-			flags |= unix.MS_NOEXEC
-		}
-		return flags
-	}
-	return uintptr(unix.MS_RDONLY | unix.MS_NODEV)
+// Merge mounts the images (sorted in merge order, as discover returns them)
+// into the hierarchies of the class. It fails with an AlreadyMergedError if
+// a hierarchy is merged already. On error everything is rolled back.
+func Merge(class release.Class, images []discover.Image, opts MergeOptions) (Outcome, error) {
+	return run(class, images, opts, false)
 }
 
-// originEntry is one element of the marker `origin` JSON array.
-type originEntry struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
-	Type string `json:"type"`
+// Refresh brings the merged state in line with images like
+// systemd-sysext refresh: images are mounted and checked first and compared
+// with the recorded origin of the current merge; only when something changed
+// (or AlwaysRefresh is set) the old merge is replaced. A failure before that
+// leaves the old merge in place. When no extension qualifies the class is
+// unmerged. The whole operation runs under one lock.
+func Refresh(class release.Class, images []discover.Image, opts MergeOptions) (Outcome, error) {
+	return run(class, images, opts, true)
 }
 
-// imageTypeString maps discover.ImageType to the origin "type" value without
-// relying on the (stub) String method.
-func imageTypeString(t discover.ImageType) string {
-	if t == discover.TypeRaw {
-		return "raw"
-	}
-	return "directory"
-}
-
-// writeMarker creates markerDir and writes the `extensions` (newline list,
-// merge order ascending) and `origin` (JSON array) marker files.
-func writeMarker(markerDir string, names []string, origins []originEntry) error {
-	if err := os.MkdirAll(markerDir, 0o755); err != nil {
-		return err
-	}
-	ext := strings.Join(names, "\n") + "\n"
-	if err := os.WriteFile(filepath.Join(markerDir, "extensions"), []byte(ext), 0o644); err != nil {
-		return err
-	}
-	js, err := json.Marshal(origins)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(markerDir, "origin"), append(js, '\n'), 0o644)
-}
-
-// readExtensionsFile parses a marker `extensions` file into names.
-func readExtensionsFile(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			names = append(names, line)
-		}
-	}
-	return names, nil
-}
-
-// readOriginFile parses a marker `origin` JSON file.
-func readOriginFile(path string) ([]originEntry, error) {
-	data, err := os.ReadFile(path)
+// Unmerge removes the merged overlays of the class, restoring mounts that
+// were made below the hierarchies, and releases the workspace. It returns
+// the resolved hierarchy paths it unmerged; nothing merged is not an error.
+func Unmerge(class release.Class, root string) ([]string, error) {
+	hierarchies, err := Hierarchies(class)
 	if err != nil {
 		return nil, err
 	}
-	var entries []originEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
+	r, err := resolveRoot(root)
+	if err != nil {
 		return nil, err
 	}
-	return entries, nil
-}
-
-// dirNonEmpty reports whether path is an existing directory with at least
-// one entry.
-func dirNonEmpty(path string) bool {
-	f, err := os.Open(path)
+	unlock, err := lock(class, r)
 	if err != nil {
-		return false
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil || !fi.IsDir() {
-		return false
-	}
-	names, err := f.Readdirnames(1)
-	return err == nil && len(names) > 0
-}
-
-// isMountPoint is the path_is_mount_point equivalent: lstat path and its
-// parent and compare st_dev; the root directory (path == parent) is always a
-// mount point, and a path sharing dev *and* inode with its parent (only
-// possible for "/"-like self-references) is too. A missing path is not a
-// mount point.
-func isMountPoint(path string) (bool, error) {
-	path = filepath.Clean(path)
-	var st unix.Stat_t
-	if err := unix.Lstat(path, &st); err != nil {
-		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) {
-			return false, nil
-		}
-		return false, fmt.Errorf("lstat %s: %w", path, err)
-	}
-	parent := filepath.Dir(path)
-	if parent == path {
-		return true, nil // "/" edge case
-	}
-	var pst unix.Stat_t
-	if err := unix.Lstat(parent, &pst); err != nil {
-		return false, fmt.Errorf("lstat %s: %w", parent, err)
-	}
-	if st.Dev != pst.Dev {
-		return true, nil
-	}
-	// Same device: only a mount point if it is the same directory as its
-	// parent (bind-mount of root onto itself style edge case).
-	return st.Ino == pst.Ino, nil
-}
-
-// IsMergedByUs reports whether hierarchy (relative to root) is currently
-// overmounted by our overlay: it is a mount point, carries
-// <hierarchy>/<marker>/dev, and that dev equals stat(hierarchy).st_dev.
-func IsMergedByUs(class release.Class, root, hierarchy string) (bool, error) {
-	target := filepath.Join(root, hierarchy)
-	mp, err := isMountPoint(target)
-	if err != nil || !mp {
-		return false, err
-	}
-	data, err := os.ReadFile(filepath.Join(target, MarkerDirName(class), "dev"))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOTDIR) {
-			return false, nil
-		}
-		return false, err
-	}
-	want, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
-	if err != nil {
-		return false, nil // malformed marker → not ours
-	}
-	var st unix.Stat_t
-	if err := unix.Stat(target, &st); err != nil {
-		return false, fmt.Errorf("stat %s: %w", target, err)
-	}
-	return uint64(st.Dev) == want, nil
-}
-
-// mergeState tracks resources acquired during Merge for rollback.
-type mergeState struct {
-	workspace string
-	mounted   []*image.Mounted // image mounts, in mount order
-	staged    []string         // overlay staging mounts not yet moved
-	moved     []string         // hierarchy targets already MS_MOVE'd
-	tmpfs     []string         // ephemeral tmpfs mounts (mutable modes)
-	workdirs  []string         // hidden overlayfs workdirs created (mutable)
-}
-
-// rollback undoes everything in reverse order. Errors are ignored: this is
-// best-effort cleanup on a failure path. The ephemeral tmpfs mounts back the
-// overlay upperdirs, so they go after the overlays but before the image
-// mounts and workspace removal.
-func (s *mergeState) rollback() {
-	for i := len(s.moved) - 1; i >= 0; i-- {
-		_ = unmountWithRetry(s.moved[i])
-	}
-	for i := len(s.staged) - 1; i >= 0; i-- {
-		_ = unmountWithRetry(s.staged[i])
-	}
-	for i := len(s.tmpfs) - 1; i >= 0; i-- {
-		_ = unmountWithRetry(s.tmpfs[i])
-	}
-	for i := len(s.workdirs) - 1; i >= 0; i-- {
-		_ = os.RemoveAll(s.workdirs[i])
-	}
-	for i := len(s.mounted) - 1; i >= 0; i-- {
-		_ = s.mounted[i].Unmount()
-	}
-	_ = os.RemoveAll(s.workspace)
-}
-
-// Merge mounts the merged overlays for the given already-validated images.
-// Steps per SPEC §4:
-//  1. create workspace dirs (0700)
-//  2. mount every image under workspace/extensions/<name> (image.Mount)
-//  3. per hierarchy: build lowerdir = meta : images reverse-sorted : host,
-//     skipping images lacking the hierarchy and a missing/empty host dir
-//  4. write marker meta dir (extensions list + origin JSON)
-//  5. mount overlay at workspace/overlay/<h> with class mount flags,
-//     stat it, write `dev` marker, then MS_MOVE onto the hierarchy
-//
-// Fails (ErrAlreadyMerged) if any target hierarchy is already merged by us.
-// On error, everything mounted so far is rolled back.
-//
-// Merge holds the per-class Lock for its whole duration, serializing against
-// concurrent Merge/Unmerge in other processes. A caller doing unmerge+merge
-// (refresh) gets two separate critical sections — see Lock.
-func Merge(class release.Class, images []discover.Image, opts MergeOptions) error {
-	if _, err := normalizeMutableMode(opts.Mutable); err != nil {
-		return err
-	}
-	unlock, err := Lock(class, opts.Root)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	for _, h := range Hierarchies(class) {
-		merged, err := IsMergedByUs(class, opts.Root, h)
-		if err != nil {
-			return fmt.Errorf("checking merge state of %s: %w", h, err)
-		}
-		if merged {
-			return fmt.Errorf("%w: %s", ErrAlreadyMerged, h)
-		}
-	}
-	if len(images) == 0 {
-		return nil
-	}
-
-	st := &mergeState{workspace: Workspace(class, opts.Root)}
-	if err := doMerge(class, images, opts, st); err != nil {
-		st.rollback()
-		return err
-	}
-	return nil
-}
-
-func doMerge(class release.Class, images []discover.Image, opts MergeOptions, st *mergeState) error {
-	ws := st.workspace
-	for _, d := range []string{ws, filepath.Join(ws, "extensions"), filepath.Join(ws, "meta"), filepath.Join(ws, "overlay")} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			return fmt.Errorf("creating workspace %s: %w", d, err)
-		}
-	}
-
-	// Mount every image under extensions/<name>. images is version-sorted
-	// ascending; remember each mounted root by index.
-	roots := make([]string, len(images))
-	for i, img := range images {
-		mp := filepath.Join(ws, "extensions", img.Name)
-		if err := os.MkdirAll(mp, 0o755); err != nil {
-			return fmt.Errorf("creating image mount point %s: %w", mp, err)
-		}
-		m, err := image.MountWithOpts(img, mp, image.MountOpts{Arch: opts.Arch, Policy: opts.ImagePolicy, TrustDir: filepath.Join(opts.Root, "/etc/verity.d")})
-		if err != nil {
-			return fmt.Errorf("mounting image %s: %w", img.Name, err)
-		}
-		st.mounted = append(st.mounted, m)
-		roots[i] = m.Root
-	}
-
-	for _, h := range Hierarchies(class) {
-		if err := mergeHierarchy(class, images, roots, opts, h, st); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// mergeHierarchy assembles and mounts the overlay for one hierarchy. Skips
-// the hierarchy entirely (no overlay) when no extension contributes to it.
-func mergeHierarchy(class release.Class, images []discover.Image, roots []string, opts MergeOptions, hierarchy string, st *mergeState) error {
-	ws := st.workspace
-	esc := escapeHierarchy(hierarchy)
-	rel := strings.TrimPrefix(filepath.Clean(hierarchy), "/")
-
-	// Contributing extension dirs, reverse version order (newest first =
-	// topmost lowerdir); contributor names recorded ascending (merge order).
-	var extDirs []string
-	var contributors []discover.Image
-	for i := range images {
-		if dirNonEmpty(filepath.Join(roots[i], rel)) {
-			contributors = append(contributors, images[i])
-		}
-	}
-	if len(contributors) == 0 {
-		return nil
-	}
-	for i := len(images) - 1; i >= 0; i-- {
-		d := filepath.Join(roots[i], rel)
-		if dirNonEmpty(d) {
-			extDirs = append(extDirs, d)
-		}
-	}
-
-	// Mutability (--mutable=): may create routing dirs/workdirs and mount an
-	// ephemeral tmpfs; those are tracked in the merge state for rollback.
-	hm, err := resolveHierarchyMutability(opts.Mutable, opts.Root, hierarchy, ws)
-	if err != nil {
-		return fmt.Errorf("resolving mutability for %s: %w", hierarchy, err)
-	}
-	if hm.tmpfs != "" {
-		st.tmpfs = append(st.tmpfs, hm.tmpfs)
-	} else if hm.workDir != "" {
-		st.workdirs = append(st.workdirs, hm.workDir)
-	}
-
-	// Marker metadata (topmost lowerdir).
-	metaDir := filepath.Join(ws, "meta", esc)
-	markerDir := filepath.Join(metaDir, MarkerDirName(class))
-	names := make([]string, len(contributors))
-	origins := make([]originEntry, len(contributors))
-	for i, img := range contributors {
-		names[i] = img.Name
-		origins[i] = originEntry{Name: img.Name, Path: img.Path, Type: imageTypeString(img.Type)}
-	}
-	if err := writeMarker(markerDir, names, origins); err != nil {
-		return fmt.Errorf("writing marker for %s: %w", hierarchy, err)
-	}
-	if hm.workDir != "" {
-		// Record the overlayfs workdir like systemd does, so unmerge can
-		// remove it even across process restarts.
-		if err := os.WriteFile(filepath.Join(markerDir, "work_dir"), []byte(hm.workDir+"\n"), 0o644); err != nil {
-			return fmt.Errorf("writing work_dir marker for %s: %w", hierarchy, err)
-		}
-	}
-
-	// lowerdir = meta : imported routing dir (import modes) :
-	// newest..oldest extension : host (if present/non-empty and not
-	// already serving as upperdir)
-	hostDir := filepath.Join(opts.Root, hierarchy)
-	if resolved, err := filepath.EvalSymlinks(hostDir); err == nil {
-		hostDir = resolved // canonical form, comparable with the resolved upperdir
-	}
-	lower := buildLowerPaths(metaDir, hm.importDir, extDirs, hostDir, dirNonEmpty(hostDir), hm.upperDir)
-
-	staging := filepath.Join(ws, "overlay", esc)
-	if err := os.MkdirAll(staging, 0o755); err != nil {
-		return fmt.Errorf("creating staging dir %s: %w", staging, err)
-	}
-	flags := overlayMountFlags(class, opts.NoExec)
-	if hm.upperDir != "" {
-		flags &^= unix.MS_RDONLY // mutable overlay must be writable
-		flags |= unix.MS_NOATIME // systemd's "noatime" mutable mount option
-	}
-	data := buildOverlayData(lower, hm.upperDir, hm.workDir)
-	if err := unix.Mount("overlay", staging, "overlay", flags, data); err != nil {
-		return fmt.Errorf("mounting overlay for %s (%s): %w", hierarchy, data, err)
-	}
-	st.staged = append(st.staged, staging)
-
-	if err := writeAndVerifyDev(staging, markerDir, MarkerDirName(class), flags, data); err != nil {
-		return fmt.Errorf("recording dev marker for %s: %w", hierarchy, err)
-	}
-
-	if err := unix.Mount(staging, hostDir, "", unix.MS_MOVE, ""); err != nil {
-		return fmt.Errorf("moving overlay onto %s: %w", hostDir, err)
-	}
-	st.staged = st.staged[:len(st.staged)-1]
-	st.moved = append(st.moved, hostDir)
-	return nil
-}
-
-// writeAndVerifyDev stats the staged overlay mount, writes its st_dev as a
-// decimal string into <markerDir>/dev (which lives in the topmost lowerdir),
-// then verifies the file is readable *through* the staged overlay. Because
-// the dev file is created after the overlay was mounted, a cached negative
-// dentry may hide it; in that case the overlay is unmounted and remounted
-// (the file now exists at mount time), restat'd (anonymous overlay devs
-// change across mounts), rewritten and re-verified.
-func writeAndVerifyDev(staging, markerDir, markerName string, flags uintptr, data string) error {
-	const attempts = 3
-	devFile := filepath.Join(markerDir, "dev")
-	mergedDevFile := filepath.Join(staging, markerName, "dev")
-	var lastErr error
-	for i := 0; i < attempts; i++ {
-		var stt unix.Stat_t
-		if err := unix.Stat(staging, &stt); err != nil {
-			return fmt.Errorf("stat %s: %w", staging, err)
-		}
-		want := strconv.FormatUint(uint64(stt.Dev), 10)
-		if err := os.WriteFile(devFile, []byte(want+"\n"), 0o644); err != nil {
-			return err
-		}
-		got, err := os.ReadFile(mergedDevFile)
-		if err == nil && strings.TrimSpace(string(got)) == want {
-			return nil
-		}
-		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("dev marker mismatch: merged tree has %q, want %q", strings.TrimSpace(string(got)), want)
-		}
-		if i == attempts-1 {
-			break
-		}
-		// Remount so the now-existing dev file is visible, then retry.
-		if err := unix.Unmount(staging, 0); err != nil {
-			return fmt.Errorf("unmounting %s for dev remount: %w", staging, err)
-		}
-		if err := unix.Mount("overlay", staging, "overlay", flags, data); err != nil {
-			return fmt.Errorf("remounting overlay at %s: %w", staging, err)
-		}
-	}
-	return fmt.Errorf("dev marker not visible through overlay at %s: %w", staging, lastErr)
-}
-
-// unmountWithRetry unmounts target, retrying on EBUSY and finally falling
-// back to a lazy MNT_DETACH. "Not mounted" conditions (EINVAL, ENOENT) are
-// treated as success so callers stay idempotent.
-func unmountWithRetry(target string) error {
-	// Not a mount point (or gone) → nothing to do. This also keeps cleanup
-	// idempotent for unprivileged callers, where umount2 on a non-mount
-	// reports EPERM before EINVAL.
-	if mp, err := isMountPoint(target); err == nil && !mp {
-		return nil
-	}
-	var err error
-	for i := 0; i < 5; i++ {
-		err = unix.Unmount(target, 0)
-		if err == nil {
-			return nil
-		}
-		if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOENT) {
-			return nil
-		}
-		if !errors.Is(err, unix.EBUSY) {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	derr := unix.Unmount(target, unix.MNT_DETACH)
-	if derr == nil || errors.Is(derr, unix.EINVAL) || errors.Is(derr, unix.ENOENT) {
-		return nil
-	}
-	return fmt.Errorf("unmounting %s: %w (lazy detach: %v)", target, err, derr)
-}
-
-// collectRawOriginPaths gathers the backing-file paths of raw images from
-// all origin markers in the workspace, deduplicated.
-func collectRawOriginPaths(class release.Class, ws string) []string {
-	seen := map[string]bool{}
-	var paths []string
-	entries, err := os.ReadDir(filepath.Join(ws, "meta"))
-	if err != nil {
-		return nil
-	}
-	for _, e := range entries {
-		origins, err := readOriginFile(filepath.Join(ws, "meta", e.Name(), MarkerDirName(class), "origin"))
-		if err != nil {
-			continue
-		}
-		for _, o := range origins {
-			if o.Type == "raw" && !seen[o.Path] {
-				seen[o.Path] = true
-				paths = append(paths, o.Path)
-			}
-		}
-	}
-	return paths
-}
-
-// Unmerge detaches all merged hierarchies for the class: for each hierarchy
-// merged by us, unmount the overlay (MNT_DETACH fallback), then unmount image
-// mounts and detach loop devices, then remove workspace dirs. Idempotent —
-// returns nil when nothing is merged.
-//
-// Unmerge holds the per-class Lock for its whole duration, serializing
-// against concurrent Merge/Unmerge in other processes — see Lock.
-func Unmerge(class release.Class, root string) error {
-	unlock, err := Lock(class, root)
-	if err != nil {
-		return err
+		return nil, err
 	}
 	defer unlock()
 
+	ws := workspaceFor(class, r)
+	var unmerged []string
 	var errs []error
-	for _, h := range Hierarchies(class) {
-		merged, err := IsMergedByUs(class, root, h)
+	for _, h := range hierarchies {
+		p, err := resolveHierarchy(r, h)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("checking %s: %w", h, err))
+			errs = append(errs, err)
 			continue
 		}
-		if !merged {
+		if p == "" {
 			continue
 		}
-		if err := unmountWithRetry(filepath.Join(root, h)); err != nil {
+		n, err := unmergeInPlace(class, r, h, p, ws)
+		if n > 0 {
+			unmerged = append(unmerged, p)
+		}
+		if err != nil {
 			errs = append(errs, err)
 		}
 	}
-
-	ws := Workspace(class, root)
-	if _, err := os.Stat(ws); errors.Is(err, os.ErrNotExist) {
-		return errors.Join(errs...)
+	if len(errs) > 0 {
+		return unmerged, errors.Join(errs...)
 	}
-
-	// Leftover staged overlays from an interrupted merge.
-	if entries, err := os.ReadDir(filepath.Join(ws, "overlay")); err == nil {
-		for _, e := range entries {
-			_ = unmountWithRetry(filepath.Join(ws, "overlay", e.Name()))
-		}
-	}
-
-	// Mutable-mode residue: ephemeral tmpfs mounts and recorded workdirs.
-	// Must run after the overlays are unmounted (tmpfs backs their upperdir)
-	// and before the workspace (holding the work_dir markers) is removed.
-	cleanupMutableLeftovers(class, ws)
-
-	// Backing-file paths must be collected before the workspace is removed.
-	rawPaths := collectRawOriginPaths(class, ws)
-
-	// Image mounts under extensions/<name>.
-	if entries, err := os.ReadDir(filepath.Join(ws, "extensions")); err == nil {
-		for _, e := range entries {
-			_ = unmountWithRetry(filepath.Join(ws, "extensions", e.Name()))
-		}
-	}
-
-	// Tear down dm-verity devices before their backing loop devices: the dm
-	// table holds the loop partitions open, so the order matters. Then
-	// detach any loop devices still backed by raw image files.
-	for _, p := range rawPaths {
-		if err := image.RemoveVerityFor(p); err != nil {
-			errs = append(errs, fmt.Errorf("removing verity device for %s: %w", p, err))
-		}
-		if err := image.DetachAllLoopsFor(p); err != nil {
-			errs = append(errs, fmt.Errorf("detaching loops for %s: %w", p, err))
-		}
-	}
-
-	if err := os.RemoveAll(ws); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return unmerged, teardownWorkspace(ws)
 }
 
-// CurrentStatus reads the per-hierarchy merge state from the markers.
-func CurrentStatus(class release.Class, root string) ([]Status, error) {
-	hierarchies := Hierarchies(class)
-	statuses := make([]Status, 0, len(hierarchies))
-	for _, h := range hierarchies {
-		s := Status{Hierarchy: h}
-		merged, err := IsMergedByUs(class, root, h)
+// unmergeHierarchy is unmerge_hierarchy(): it unmounts our overlays at dir
+// (several when stacked), after taking the mounts below it aside, which
+// the caller attaches where they belong. The recorded workdirs are removed.
+func unmergeHierarchy(class release.Class, root, hierarchy, dir, ws string) ([]savedMount, int, error) {
+	var subs []savedMount
+	n := 0
+	for {
+		ours, err := isOurMountPoint(class, dir)
 		if err != nil {
-			return nil, err
+			return subs, n, err
 		}
-		if merged {
-			s.Merged = true
-			markerDir := filepath.Join(root, h, MarkerDirName(class))
-			if names, err := readExtensionsFile(filepath.Join(markerDir, "extensions")); err == nil {
-				s.Extensions = names
-			}
-			if fi, err := os.Stat(markerDir); err == nil {
-				s.Since = fi.ModTime().Unix()
+		if !ours {
+			return subs, n, nil
+		}
+		workDir, err := recordedWorkDir(class, root, dir, hierarchy)
+		if err != nil {
+			return subs, n, err
+		}
+		if err := detach(filepath.Join(dir, MarkerDirName(class))); err != nil {
+			return subs, n, err
+		}
+		s, err := takeSubmounts(dir, belowWorkspace(ws, dir))
+		subs = append(subs, s...)
+		if err != nil {
+			return subs, n, err
+		}
+		if err := unix.Unmount(dir, unix.MNT_DETACH|unix.UMOUNT_NOFOLLOW); err != nil {
+			return subs, n, fmt.Errorf("failed to unmount %s: %w", dir, err)
+		}
+		n++
+		if workDir != "" {
+			if err := removeTree(workDir); err != nil {
+				return subs, n, fmt.Errorf("failed to remove '%s': %w", workDir, err)
 			}
 		}
-		statuses = append(statuses, s)
 	}
-	return statuses, nil
 }
 
-// MergedExtensions returns the extension names recorded in the marker of a
-// merged hierarchy (empty if unmerged). Used by refresh change detection.
-func MergedExtensions(class release.Class, root, hierarchy string) ([]string, error) {
-	merged, err := IsMergedByUs(class, root, hierarchy)
-	if err != nil || !merged {
-		return nil, err
+// belowWorkspace keeps the mounts of the workspace out of the submounts
+// carried along with dir, unless dir itself lies inside the workspace (an
+// overlay at its staging point, whose submounts all came from the host).
+func belowWorkspace(ws, dir string) func(string) bool {
+	if fsutil.IsBelow(dir, ws) {
+		return nil
 	}
-	return readExtensionsFile(filepath.Join(root, hierarchy, MarkerDirName(class), "extensions"))
+	return func(p string) bool { return fsutil.IsBelow(p, ws) }
 }

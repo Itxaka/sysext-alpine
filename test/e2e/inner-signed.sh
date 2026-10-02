@@ -1,13 +1,12 @@
 #!/bin/sh
-# e2e test suite for SIGNED dm-verity protected GPT DDIs. Runs INSIDE a
-# privileged Alpine container (launched by run.sh, which auto-runs every
-# inner*.sh).
+# e2e-fixtures: repart
 #
-# Builds a GPT image with a root (x86-64) data partition, a root-verity
-# partition (veritysetup) and a root-verity-sig partition carrying the UAPI
-# DPS signature JSON: the verity root hash plus a detached PKCS#7 signature
-# over the ASCII hex root hash, made with a throwaway openssl key/cert.
-# The certificate is installed to /etc/verity.d/ as the trust anchor.
+# e2e suite for SIGNED dm-verity protected GPT DDIs. Builds a GPT image with
+# a root data partition for the host architecture, a root-verity partition
+# (veritysetup) and a root-verity-sig partition carrying the UAPI DPS
+# signature JSON: the verity root hash plus a detached PKCS#7 signature over
+# the ASCII hex root hash, made with a throwaway openssl key/cert. The
+# certificate is installed to /etc/verity.d/ as the trust anchor.
 #
 # Exercises:
 #   (a) merge with --image-policy=root=signed (trusted cert installed)
@@ -16,205 +15,71 @@
 #       degradation warning (plain verity still enforced)
 #   (d) corrupted signature partition JSON -> root=signed merge must fail
 #   (e) unsigned image (no sig partition) -> root=signed merge must fail
-#   (f) optional: a real systemd-built signed DDI dropped into
-#       /work/test/fixtures (signed-*.raw + *.crt) is merged for compat
-#       validation.
-#
-# The whole suite SKIPs when openssl, veritysetup or the dm-verity target
-# is unavailable. PASS/FAIL/SKIP accounting as in inner-verity.sh.
-set -u
+#   (f) a real signed DDI built by systemd-repart: examples/signed-example.raw
+#       (run.sh builds it with archlinux:latest) and any test/fixtures/
+#       signed-*.raw with its certificate
+. /work/test/e2e/lib.sh
 
-FAILS=0
-SKIPS=0
-
-pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
-skip() { echo "SKIP: $*"; SKIPS=$((SKIPS + 1)); }
-
-finish() {
-    echo "==========================================="
-    echo "Failures: $FAILS  Skips: $SKIPS"
-    if [ "$FAILS" -gt 0 ]; then
-        echo "RESULT: FAIL"
-        exit 1
-    fi
-    echo "RESULT: PASS"
-    exit 0
-}
-
-fs_supported() {
-    grep -qw "$1" /proc/filesystems && return 0
-    modprobe "$1" 2>/dev/null || true
-    grep -qw "$1" /proc/filesystems
-}
-
-# ---------------------------------------------------------------------------
-# Environment setup
-# ---------------------------------------------------------------------------
 echo "=== Installing build dependencies ==="
-apk add --no-cache openssl cryptsetup device-mapper e2fsprogs \
-    util-linux kmod \
-    || { echo "FATAL: apk add failed"; exit 1; }
-
-if [ ! -x /work/bin/sysext ]; then
-    echo "FATAL: /work/bin/sysext missing (run 'make build-static' on the host)"
-    exit 1
-fi
-install -m 0755 /work/bin/sysext /usr/bin/sysext
-
-if ! fs_supported overlay; then
-    echo "FATAL: kernel does not support overlayfs; cannot test anything"
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Capability checks — SKIP the whole suite if signing/verity cannot work here
-# ---------------------------------------------------------------------------
-if ! command -v openssl >/dev/null 2>&1; then
-    skip "openssl not available; skipping signed-verity suite"
-    finish
-fi
-
-if ! command -v veritysetup >/dev/null 2>&1; then
-    skip "veritysetup not available; skipping signed-verity suite"
-    finish
-fi
-
-if ! fs_supported ext4; then
-    skip "ext4 not supported by host kernel; skipping signed-verity suite"
-    finish
-fi
-
-modprobe dm-verity 2>/dev/null || modprobe dm_verity 2>/dev/null || true
-if ! dmsetup targets 2>/dev/null | grep -qw verity; then
-    skip "dm-verity target unavailable (modprobe failed?); skipping signed-verity suite"
+pkg_add openssl cryptsetup device-mapper e2fsprogs kmod erofs-utils squashfs-tools
+install_sysext
+need_overlayfs
+fs_supported ext4 || fatal "kernel lacks ext4"
+[ -n "$ROOT_GUID" ] || fatal "no partition types known for $HOST_ARCH"
+if ! verity_supported; then
+    skip dm-verity "dm-verity target or veritysetup unavailable; skipping the signed-verity suite"
     finish
 fi
 echo "dm-verity target available"
 
+verity_gone() { released; }
+
 mkdir -p /var/lib/extensions /etc/verity.d
-WORKDIR=/tmp/e2e-signed
-mkdir -p "$WORKDIR"
 
-# ---------------------------------------------------------------------------
-# Signing key + certificate (throwaway, self-signed)
-# ---------------------------------------------------------------------------
 echo "=== Generating signing key and certificate ==="
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-    -subj /CN=sysext-test \
-    -keyout "$WORKDIR/key.pem" -out "$WORKDIR/cert.pem" 2>/dev/null \
-    || { echo "FATAL: openssl key/cert generation failed"; exit 1; }
-
+new_cert cert -days 1 || fatal "openssl key/cert generation failed"
 # A second, unrelated cert: the "untrusted signer" trust anchor for (c).
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-    -subj /CN=sysext-other \
-    -keyout "$WORKDIR/other-key.pem" -out "$WORKDIR/other-cert.pem" 2>/dev/null \
-    || { echo "FATAL: openssl second key/cert generation failed"; exit 1; }
+new_cert other-cert -days 1 || fatal "openssl second key/cert generation failed"
 
-# ---------------------------------------------------------------------------
-# Test image construction
-# ---------------------------------------------------------------------------
 echo "=== Building signed verity test image ==="
-
 NAME=test-signed
 IMG=/var/lib/extensions/$NAME.raw
-DATA=$WORKDIR/data.img
-HASH=$WORKDIR/hash.img
-DM_NODE=/dev/mapper/sysext-$NAME-verity
-
-# UAPI Discoverable Partitions Spec type GUIDs (x86-64).
-ROOT_GUID=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709
-ROOT_VERITY_GUID=2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5
-ROOT_VERITY_SIG_GUID=41092B05-9FC8-4523-994F-2DEF0408B176
-
-# Partition layout (512-byte sectors): data 8 MiB @ 2048, verity 4 MiB
-# @ 18432, signature 1 MiB @ 26624, image 16 MiB total.
+# Partition layout of ddi_build -g in 512-byte sectors: data 8 MiB at 2048,
+# verity 4 MiB at 18432, signature 1 MiB at 26624, image 16 MiB.
 DATA_START=2048
 DATA_SECTORS=16384
 VERITY_START=18432
 VERITY_SECTORS=8192
 SIG_START=26624
-SIG_SECTORS=2048
 IMG_MIB=16
 
-# Payload tree (same conventions as inner-verity.sh).
-tree=$WORKDIR/tree
-mkdir -p "$tree/usr/lib/extension-release.d" \
-         "$tree/usr/share/$NAME" \
-         "$tree/usr/bin"
-printf 'ID=_any\nARCHITECTURE=_any\n' \
-    > "$tree/usr/lib/extension-release.d/extension-release.$NAME"
-echo "hello from $NAME" > "$tree/usr/share/$NAME/hello.txt"
-printf '#!/bin/sh\necho %s-tool\n' "$NAME" > "$tree/usr/bin/$NAME-tool"
-chmod 0755 "$tree/usr/bin/$NAME-tool"
-
-dd if=/dev/zero of="$DATA" bs=512 count=$DATA_SECTORS status=none
-if ! mkfs.ext4 -q -F -b 4096 -d "$tree" "$DATA" 2>/dev/null; then
-    mkfs.ext4 -q -F -b 4096 "$DATA" || { echo "FATAL: mkfs.ext4 failed"; exit 1; }
-    mnt=$WORKDIR/mnt
-    mkdir -p "$mnt"
-    mount -o loop "$DATA" "$mnt" || { echo "FATAL: loop mount failed"; exit 1; }
-    cp -a "$tree"/. "$mnt"/
-    umount "$mnt"
-fi
-
-ROOTHASH=$(veritysetup format "$DATA" "$HASH" | awk '/^Root hash/{print $3}')
+mk_tree "$WORKDIR/tree" "$NAME"
+ddi_build "$WORKDIR/$NAME.raw" "$WORKDIR/tree" -g || fatal "building $NAME.raw failed"
+DATA=$DDI_DATA
+HASH=$DDI_HASH
+ROOTHASH=$DDI_ROOTHASH
 if [ "${#ROOTHASH}" != 64 ]; then
     fail "veritysetup format did not yield a 64-hex root hash (got '$ROOTHASH')"
     finish
 fi
 echo "verity root hash: $ROOTHASH"
+DATA_UUID=$(uuid_of "$(echo "$ROOTHASH" | cut -c1-32)")
+VERITY_UUID=$(uuid_of "$(echo "$ROOTHASH" | cut -c33-64)")
 
-# ---------------------------------------------------------------------------
 # Signature JSON (UAPI DPS): rootHash + base64 DER PKCS#7 detached signature
-# over the exact ASCII hex root hash (no trailing newline!).
-# ---------------------------------------------------------------------------
-printf %s "$ROOTHASH" > "$WORKDIR/roothash.txt"
-openssl smime -sign -in "$WORKDIR/roothash.txt" \
-    -signer "$WORKDIR/cert.pem" -inkey "$WORKDIR/key.pem" \
-    -binary -outform der -noattr > "$WORKDIR/sig.der" \
+# over the exact ASCII hex root hash, NUL-padded to a multiple of 4096 bytes.
+smime_sign "$WORKDIR/cert.key" "$WORKDIR/cert.pem" "$ROOTHASH" "$WORKDIR/sig.der" \
     || { fail "openssl smime signing failed"; finish; }
-
-SIG_B64=$(openssl base64 -A -in "$WORKDIR/sig.der")
-CERT_FP=$(openssl x509 -in "$WORKDIR/cert.pem" -outform der \
-          | sha256sum | cut -d' ' -f1)
-
-printf '{"rootHash":"%s","signature":"%s","certificateFingerprint":"%s"}' \
-    "$ROOTHASH" "$SIG_B64" "$CERT_FP" > "$WORKDIR/sig.json"
-
-# NUL-pad to a multiple of 4096 bytes, as the spec mandates.
+CERT_FP=$(openssl x509 -in "$WORKDIR/cert.pem" -outform der | sha256sum | cut -d' ' -f1)
+sig_json "$ROOTHASH" "$WORKDIR/sig.der" "$CERT_FP" > "$WORKDIR/sig.json"
 size=$(wc -c < "$WORKDIR/sig.json")
 padding=$(( (4096 - size % 4096) % 4096 ))
 if [ "$padding" -gt 0 ]; then
     head -c "$padding" /dev/zero >> "$WORKDIR/sig.json"
 fi
 echo "signature blob: $(wc -c < "$WORKDIR/sig.json") bytes (cert sha256 $CERT_FP)"
-
-# Root-hash discovery rule: data partition unique UUID = first 128 bits of
-# the root hash, verity partition unique UUID = last 128 bits.
-uuid_of() {
-    h=$1
-    printf '%s-%s-%s-%s-%s' \
-        "$(echo "$h" | cut -c1-8)" \
-        "$(echo "$h" | cut -c9-12)" \
-        "$(echo "$h" | cut -c13-16)" \
-        "$(echo "$h" | cut -c17-20)" \
-        "$(echo "$h" | cut -c21-32)"
-}
-DATA_UUID=$(uuid_of "$(echo "$ROOTHASH" | cut -c1-32)")
-VERITY_UUID=$(uuid_of "$(echo "$ROOTHASH" | cut -c33-64)")
-
-dd if=/dev/zero of="$IMG" bs=1M count=$IMG_MIB status=none
-sfdisk -q "$IMG" <<EOF || { fail "sfdisk failed building $IMG"; finish; }
-label: gpt
-start=$DATA_START, size=$DATA_SECTORS, type=$ROOT_GUID, uuid=$DATA_UUID
-start=$VERITY_START, size=$VERITY_SECTORS, type=$ROOT_VERITY_GUID, uuid=$VERITY_UUID
-start=$SIG_START, size=$SIG_SECTORS, type=$ROOT_VERITY_SIG_GUID
-EOF
-
-dd if="$DATA" of="$IMG" bs=512 seek=$DATA_START conv=notrunc status=none
-dd if="$HASH" of="$IMG" bs=512 seek=$VERITY_START conv=notrunc status=none
-dd if="$WORKDIR/sig.json" of="$IMG" bs=512 seek=$SIG_START conv=notrunc status=none
+ddi_write_sig "$WORKDIR/$NAME.raw" "$WORKDIR/sig.json"
+cp "$WORKDIR/$NAME.raw" "$IMG"
 echo "built: $NAME.raw (GPT: root + root-verity + root-verity-sig)"
 
 # Trust anchor in place for (a).
@@ -238,10 +103,10 @@ else
     fail "payload missing/corrupt: /usr/share/$NAME/hello.txt"
 fi
 
-if [ -b "$DM_NODE" ]; then
-    pass "dm-verity device node exists: $DM_NODE"
+if [ -n "$(verity_devs)" ]; then
+    pass "dm-verity device active: $(verity_devs)"
 else
-    fail "dm-verity device node missing: $DM_NODE"
+    fail "no dm-verity device active"
 fi
 
 if sysext unmerge; then
@@ -250,10 +115,10 @@ else
     fail "unmerge after signed merge"
 fi
 
-if [ -e "$DM_NODE" ]; then
-    fail "dm-verity device still present after unmerge: $DM_NODE"
-else
+if verity_gone; then
     pass "dm-verity device removed after unmerge"
+else
+    fail "dm-verity device still present after unmerge: $(verity_devs)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -263,7 +128,7 @@ rm -f /etc/verity.d/*.crt
 
 if sysext --image-policy=root=signed merge 2>/dev/null; then
     fail "merge with root=signed succeeded without any trust anchor"
-    sysext unmerge || true
+    sysext unmerge
 else
     pass "merge with root=signed rejected without trust anchor"
 fi
@@ -280,7 +145,7 @@ if out=$(sysext --image-policy=root=signed+verity merge 2>&1); then
     else
         fail "no degradation warning in output: $out"
     fi
-    if [ -b "$DM_NODE" ]; then
+    if [ -n "$(verity_devs)" ]; then
         pass "dm-verity still enforced after degradation"
     else
         fail "dm-verity device missing after degradation"
@@ -298,7 +163,7 @@ fi
 # Untrusted cert + signed-only policy must fail outright.
 if sysext --image-policy=root=signed merge 2>/dev/null; then
     fail "merge with root=signed succeeded with untrusted cert"
-    sysext unmerge || true
+    sysext unmerge
 else
     pass "merge with root=signed rejected with untrusted cert"
 fi
@@ -313,7 +178,7 @@ dd if=/dev/urandom of="$IMG" bs=512 seek=$SIG_START count=1 conv=notrunc status=
 
 if sysext --image-policy=root=signed merge 2>/dev/null; then
     fail "merge with root=signed succeeded despite corrupted signature JSON"
-    sysext unmerge || true
+    sysext unmerge
 else
     pass "merge with root=signed rejected with corrupted signature JSON"
 fi
@@ -327,18 +192,15 @@ dd if="$WORKDIR/sig.json" of="$IMG" bs=512 seek=$SIG_START conv=notrunc status=n
 mv "$IMG" "$WORKDIR/$NAME.raw.signed"
 
 UNSIGNED=/var/lib/extensions/$NAME.raw
-dd if=/dev/zero of="$UNSIGNED" bs=1M count=$IMG_MIB status=none
-sfdisk -q "$UNSIGNED" <<EOF || { fail "sfdisk failed building unsigned image"; finish; }
-label: gpt
-start=$DATA_START, size=$DATA_SECTORS, type=$ROOT_GUID, uuid=$DATA_UUID
-start=$VERITY_START, size=$VERITY_SECTORS, type=$ROOT_VERITY_GUID, uuid=$VERITY_UUID
-EOF
-dd if="$DATA" of="$UNSIGNED" bs=512 seek=$DATA_START conv=notrunc status=none
-dd if="$HASH" of="$UNSIGNED" bs=512 seek=$VERITY_START conv=notrunc status=none
+printf 'label: gpt\nstart=%d, size=%d, type=%s, uuid=%s\nstart=%d, size=%d, type=%s, uuid=%s\n' \
+    $DATA_START $DATA_SECTORS "$ROOT_GUID" "$DATA_UUID" $VERITY_START $VERITY_SECTORS "$ROOT_VERITY_GUID" "$VERITY_UUID" \
+    | part_image "$UNSIGNED" 512 $IMG_MIB || { fail "sfdisk failed building unsigned image"; finish; }
+img_put "$DATA" "$UNSIGNED" 512 $DATA_START
+img_put "$HASH" "$UNSIGNED" 512 $VERITY_START
 
 if sysext --image-policy=root=signed merge 2>/dev/null; then
     fail "merge with root=signed succeeded on unsigned image"
-    sysext unmerge || true
+    sysext unmerge
 else
     pass "merge with root=signed rejected on unsigned image"
 fi
@@ -346,7 +208,7 @@ fi
 # Sanity: the unsigned image still merges as plain verity.
 if sysext --image-policy=root=verity merge >/dev/null 2>&1; then
     pass "unsigned image still merges with root=verity"
-    sysext unmerge || true
+    sysext unmerge
 else
     fail "unsigned image no longer merges with root=verity"
 fi
@@ -354,91 +216,47 @@ fi
 rm -f "$UNSIGNED"
 
 # ---------------------------------------------------------------------------
-# (f) optional real-fixture compat test: drop a systemd-built signed DDI as
-#     /work/test/fixtures/signed-*.raw plus its signer certificate as
-#     /work/test/fixtures/*.crt or *.pem (e.g. systemd-repart
-#     --certificate=db.pem output) to validate interoperability.
-#
-#     Branches on certificate validity: a fixture signed with an expired
-#     certificate must be REJECTED under root=signed (proving expiry is
-#     honored, like systemd/openssl) and must DEGRADE to plain verity under
-#     root=signed+verity. A fixture with a valid certificate must merge
-#     under root=signed directly.
+# (f) real signed DDIs built by systemd-repart. Like systemd, the
+#     certificate's validity period is not checked.
 # ---------------------------------------------------------------------------
-FIXTURE_IMG=$(ls /work/test/fixtures/signed-*.raw 2>/dev/null | head -n1)
-# Prefer db.pem (systemd-repart --certificate= convention), then *.crt,
-# then any other *.pem.
-if [ -f /work/test/fixtures/db.pem ]; then
-    FIXTURE_CRT=/work/test/fixtures/db.pem
-else
-    FIXTURE_CRT=$(ls /work/test/fixtures/*.crt \
-        /work/test/fixtures/*.pem 2>/dev/null | head -n1)
-fi
-# No local fixture: fall back to the committed signed example (a genuine
-# systemd-repart artifact with public test keys, see examples/README.md).
-if [ -z "${FIXTURE_IMG:-}" ] && [ -f /work/examples/signed-example.raw ]; then
-    FIXTURE_IMG=/work/examples/signed-example.raw
-    FIXTURE_CRT=/work/examples/keys/db.pem
-fi
-if [ -n "${FIXTURE_IMG:-}" ] && [ -n "${FIXTURE_CRT:-}" ]; then
-    echo "=== Real signed fixture: $FIXTURE_IMG (cert: $FIXTURE_CRT) ==="
+# fixture IMG CERT [PAYLOAD-PATH CONTENT]
+fixture() {
+    fimg=$1 fcrt=$2
+    echo "=== Real signed fixture: $fimg (cert: $fcrt) ==="
     rm -f /etc/verity.d/*.crt /var/lib/extensions/*.raw
-    cp "$FIXTURE_CRT" /etc/verity.d/fixture.crt
-    cp "$FIXTURE_IMG" "/var/lib/extensions/$(basename "$FIXTURE_IMG")"
-    # --force skips the host/version (and release-file) validation: CI
-    # signing fixtures may carry no extension-release payload. Signature
+    cp "$fcrt" /etc/verity.d/fixture.crt
+    cp "$fimg" "/var/lib/extensions/$(basename "$fimg")"
+    # --force skips the host/version (and release-file) validation: signing
+    # fixtures may carry no extension-release payload. Signature
     # verification is never skipped.
-    if openssl x509 -checkend 0 -noout -in "$FIXTURE_CRT" >/dev/null 2>&1; then
-        # Valid certificate: signed-only policy must succeed.
-        if out=$(sysext --image-policy=root=signed --force merge 2>&1); then
-            pass "real signed fixture merged with root=signed"
-            # The committed example carries a known payload — verify it.
-            if [ "$FIXTURE_IMG" = /work/examples/signed-example.raw ]; then
-                if [ "$(cat /usr/share/signed-example/hello.txt 2>/dev/null)" = "hello from signed-example" ]; then
-                    pass "example payload readable through signed merge"
-                else
-                    fail "example payload missing/incorrect after signed merge"
-                fi
-            fi
-            sysext unmerge || fail "unmerge after fixture merge"
-        else
-            fail "real signed fixture rejected: $out"
+    if out=$(sysext --image-policy=root=signed --force merge 2>&1); then
+        pass "real signed fixture $(basename "$fimg") merged with root=signed"
+        if [ -n "${3:-}" ]; then
+            expect_eq "fixture payload readable through the signed merge" "$(cat "$3" 2>/dev/null)" "$4"
         fi
+        if [ -n "$(verity_devs)" ]; then
+            pass "dm-verity active for real fixture"
+        else
+            fail "no dm-verity device for real fixture"
+        fi
+        sysext unmerge || fail "unmerge after fixture merge"
     else
-        echo "(fixture certificate is expired — testing rejection + degradation)"
-        # Expired certificate: signed-only policy must reject ...
-        if sysext --image-policy=root=signed --force merge 2>/dev/null; then
-            fail "expired-cert fixture accepted under root=signed"
-            sysext unmerge >/dev/null 2>&1 || true
-        else
-            pass "expired-cert fixture rejected under root=signed"
-        fi
-        # ... and signed+verity must degrade to plain verity with a warning.
-        if out=$(sysext "--image-policy=root=signed+verity" --force merge 2>&1); then
-            pass "expired-cert fixture degraded to verity under root=signed+verity"
-            case $out in
-                *[Ww]arning*) pass "degradation warning emitted" ;;
-                *) fail "no degradation warning in output: $out" ;;
-            esac
-            # dm-verity must actually be active for the fixture.
-            base=$(basename "$FIXTURE_IMG" .raw)
-            if [ -e "/dev/mapper/sysext-$base-verity" ]; then
-                pass "dm-verity active for real fixture"
-            else
-                fail "no dm-verity device for real fixture"
-            fi
-            sysext unmerge || fail "unmerge after degraded fixture merge"
-        else
-            fail "expired-cert fixture did not degrade under root=signed+verity: $out"
-        fi
+        fail "real signed fixture rejected: $out"
     fi
-    rm -f "/var/lib/extensions/$(basename "$FIXTURE_IMG")"
+    rm -f "/var/lib/extensions/$(basename "$fimg")" /etc/verity.d/fixture.crt
+}
+
+if [ -f /work/examples/signed-example.raw ]; then
+    fixture /work/examples/signed-example.raw /work/examples/keys/db.pem \
+        /usr/share/signed-example/hello.txt "hello from signed-example"
 else
-    skip "no real signed fixture (drop signed-*.raw + *.crt/*.pem into test/fixtures to enable)"
+    skip fixture:signed-example "examples/signed-example.raw missing (run.sh builds it with archlinux:latest, or run 'make example')"
 fi
+# Additional local fixtures: test/fixtures/signed-*.raw signed by
+# test/fixtures/db.pem (systemd-repart --certificate= convention).
+for f in /work/test/fixtures/signed-*.raw; do
+    [ -f "$f" ] && [ -f /work/test/fixtures/db.pem ] && fixture "$f" /work/test/fixtures/db.pem
+done
 
-# Final cleanup so the container exits with nothing mounted.
-sysext unmerge >/dev/null 2>&1 || true
 rm -f /etc/verity.d/test.crt
-
 finish

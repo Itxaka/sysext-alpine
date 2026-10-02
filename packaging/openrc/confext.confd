@@ -1,0 +1,13 @@
+# Options for /etc/init.d/confext, passed to confext refresh and unmerge.
+#
+# --noexec=false keeps the merged /etc executable: OpenRC runs the scripts in
+# /etc/init.d (and /etc/local.d, /etc/periodic, network hooks, ...) directly,
+# which fails on a noexec /etc. Unset, the init script uses --noexec=false.
+#
+# A merged /etc is read-only: rc-update, apk, udhcpc (/etc/resolv.conf) and
+# anything else writing to /etc fail while confexts are merged. Hosts that
+# need to write to /etc can use a mutable mode, e.g.
+#   --mutable=ephemeral   writes go to a tmpfs and are lost on unmerge
+#   --mutable=auto        writes go to /var/lib/extensions.mutable/etc when
+#                         that directory exists
+CONFEXT_OPTS="--noexec=false"

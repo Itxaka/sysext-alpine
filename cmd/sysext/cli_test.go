@@ -2,21 +2,48 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	extconf "github.com/itxaka/sysext-alpine/internal/config"
-	"github.com/itxaka/sysext-alpine/internal/discover"
 	"github.com/itxaka/sysext-alpine/internal/overlay"
 	"github.com/itxaka/sysext-alpine/internal/release"
 )
 
-// NOTE: these tests exercise CLI-local code (parsing, formatting, config
-// application, refresh-skip and reload decisions) plus the read-only verbs
-// against temporary --root trees; nothing here mounts or needs privileges.
+// hermetic clears the environment variables the CLI reads.
+func hermetic(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"SYSTEMD_LOG_LEVEL", "DEBUG_INVOCATION", "RC_SVCNAME", "SYSTEMD_EXEC_PID",
+		"SYSTEMD_INVOKED_AS", "SYSTEMD_IN_INITRD", "SYSTEMD_OS_RELEASE",
+		"SYSTEMD_SYSEXT_HIERARCHIES", "SYSTEMD_CONFEXT_HIERARCHIES",
+		"SYSTEMD_SYSEXT_MUTABLE_MODE", "SYSTEMD_CONFEXT_MUTABLE_MODE",
+		"SYSTEMD_SYSEXT_OVERLAYFS_MOUNT_OPTIONS", "SYSTEMD_CONFEXT_OVERLAYFS_MOUNT_OPTIONS",
+	} {
+		t.Setenv(k, "")
+		os.Unsetenv(k)
+	}
+	t.Setenv("SYSTEMD_PROC_CMDLINE", "")
+	t.Setenv("COLUMNS", "80")
+}
+
+// runCLI runs the command line and returns stdout, stderr and the status.
+func runCLI(t *testing.T, args ...string) (string, string, int) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	rc := run(args, &stdout, &stderr)
+	return stdout.String(), stderr.String(), rc
+}
+
+// parse parses args into a fresh cli.
+func parse(t *testing.T, args ...string) (*cli, bool, error) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	c := &cli{stdout: &stdout, log: &logger{w: &stderr, level: logInfo}}
+	done, err := c.parseArgs(args)
+	return c, done, err
+}
 
 // writeFile creates <root>/<rel> with content, making parent dirs.
 func writeFile(t *testing.T, root, rel, content string) {
@@ -30,681 +57,499 @@ func writeFile(t *testing.T, root, rel, content string) {
 	}
 }
 
-func TestClassFromArgv0(t *testing.T) {
-	cases := []struct {
-		argv0 string
-		want  release.Class
-	}{
-		{"sysext", release.Sysext},
-		{"/usr/bin/sysext", release.Sysext},
-		{"systemd-sysext", release.Sysext},
-		{"confext", release.Confext},
-		{"/usr/bin/confext", release.Confext},
-		{"systemd-confext", release.Confext},
-		{"/some/confext-dir/sysext", release.Sysext}, // only basename counts
-	}
-	for _, tc := range cases {
-		if got := classFromArgv0(tc.argv0); got != tc.want {
-			t.Errorf("classFromArgv0(%q) = %v, want %v", tc.argv0, got, tc.want)
+func TestClassFromInvocation(t *testing.T) {
+	hermetic(t)
+	for argv0, want := range map[string]release.Class{
+		"sysext":                   release.Sysext,
+		"/usr/bin/systemd-sysext":  release.Sysext,
+		"confext":                  release.Confext,
+		"/usr/bin/systemd-confext": release.Confext,
+		"/some/confext-dir/sysext": release.Sysext,
+	} {
+		if got := classFromInvocation(argv0); got != want {
+			t.Errorf("classFromInvocation(%q) = %v, want %v", argv0, got, want)
 		}
+	}
+	t.Setenv("SYSTEMD_INVOKED_AS", "/usr/bin/systemd-confext")
+	if classFromInvocation("sysext") != release.Confext {
+		t.Error("$SYSTEMD_INVOKED_AS must win over argv[0]")
 	}
 }
 
 func TestParseArgsDefaults(t *testing.T) {
-	cfg, err := parseArgs([]string{"sysext"})
-	if err != nil {
-		t.Fatalf("parseArgs: %v", err)
+	hermetic(t)
+	c, done, err := parse(t, "sysext")
+	if err != nil || done {
+		t.Fatalf("parseArgs: done=%v err=%v", done, err)
 	}
-	if cfg.class != release.Sysext {
-		t.Errorf("class = %v, want Sysext", cfg.class)
-	}
-	if cfg.verb != "status" {
-		t.Errorf("verb = %q, want status", cfg.verb)
-	}
-	if !cfg.noExec {
-		t.Error("noExec default should be true")
-	}
-	if cfg.jsonMode != jsonOff {
-		t.Errorf("jsonMode = %q, want off", cfg.jsonMode)
-	}
-	if cfg.alwaysRefresh || cfg.force || cfg.noReload || cfg.noLegend ||
-		cfg.showHelp || cfg.showVersion {
-		t.Error("boolean flags should default to false")
-	}
-	if cfg.root != "" {
-		t.Errorf("root = %q, want empty", cfg.root)
+	cfg := c.cfg
+	if cfg.class != release.Sysext || cfg.noExec != overlay.NoExecDefault || cfg.jsonMode != jsonOff ||
+		!cfg.legend || cfg.root != "" || cfg.force || cfg.noReload || cfg.alwaysRefresh ||
+		cfg.mutableSet || cfg.imagePolicySet || len(cfg.args) != 0 {
+		t.Errorf("defaults = %+v", cfg)
 	}
 }
 
-func TestParseArgsFlags(t *testing.T) {
+func TestParseArgs(t *testing.T) {
+	hermetic(t)
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
-		name  string
 		args  []string
-		check func(t *testing.T, cfg *config)
+		check func(*config) bool
 	}{
-		{"root equals", []string{"sysext", "--root=/mnt"},
-			func(t *testing.T, c *config) {
-				if c.root != "/mnt" {
-					t.Errorf("root = %q", c.root)
-				}
-			}},
-		{"root separate value", []string{"sysext", "--root", "/mnt"},
-			func(t *testing.T, c *config) {
-				if c.root != "/mnt" {
-					t.Errorf("root = %q", c.root)
-				}
-			}},
-		{"force", []string{"sysext", "--force"},
-			func(t *testing.T, c *config) {
-				if !c.force {
-					t.Error("force not set")
-				}
-			}},
-		{"noexec equals false", []string{"sysext", "--noexec=false"},
-			func(t *testing.T, c *config) {
-				if c.noExec {
-					t.Error("noExec should be false")
-				}
-			}},
-		{"noexec separate no", []string{"sysext", "--noexec", "no"},
-			func(t *testing.T, c *config) {
-				if c.noExec {
-					t.Error("noExec should be false")
-				}
-			}},
-		{"noexec yes", []string{"sysext", "--noexec=yes"},
-			func(t *testing.T, c *config) {
-				if !c.noExec {
-					t.Error("noExec should be true")
-				}
-			}},
-		{"json short", []string{"sysext", "--json=short"},
-			func(t *testing.T, c *config) {
-				if c.jsonMode != jsonShort {
-					t.Errorf("jsonMode = %q", c.jsonMode)
-				}
-			}},
-		{"json pretty separate", []string{"sysext", "--json", "pretty"},
-			func(t *testing.T, c *config) {
-				if c.jsonMode != jsonPretty {
-					t.Errorf("jsonMode = %q", c.jsonMode)
-				}
-			}},
-		{"json off", []string{"sysext", "--json=off"},
-			func(t *testing.T, c *config) {
-				if c.jsonMode != jsonOff {
-					t.Errorf("jsonMode = %q", c.jsonMode)
-				}
-			}},
-		{"no-reload", []string{"sysext", "--no-reload"},
-			func(t *testing.T, c *config) {
-				if !c.noReload {
-					t.Error("noReload not set")
-				}
-			}},
-		{"always-refresh yes", []string{"sysext", "--always-refresh=yes"},
-			func(t *testing.T, c *config) {
-				if !c.alwaysRefresh {
-					t.Error("alwaysRefresh not set")
-				}
-			}},
-		{"always-refresh no", []string{"sysext", "--always-refresh=no"},
-			func(t *testing.T, c *config) {
-				if c.alwaysRefresh {
-					t.Error("alwaysRefresh should be false")
-				}
-			}},
-		{"always-refresh separate", []string{"sysext", "--always-refresh", "yes"},
-			func(t *testing.T, c *config) {
-				if !c.alwaysRefresh {
-					t.Error("alwaysRefresh not set")
-				}
-			}},
-		{"no-pager accepted", []string{"sysext", "--no-pager"},
-			func(t *testing.T, c *config) {}},
-		{"no-legend", []string{"sysext", "--no-legend"},
-			func(t *testing.T, c *config) {
-				if !c.noLegend {
-					t.Error("noLegend not set")
-				}
-			}},
-		{"confext flag", []string{"sysext", "--confext"},
-			func(t *testing.T, c *config) {
-				if c.class != release.Confext {
-					t.Error("class should be Confext")
-				}
-			}},
-		{"argv0 confext", []string{"/usr/bin/confext", "status"},
-			func(t *testing.T, c *config) {
-				if c.class != release.Confext {
-					t.Error("class should be Confext via argv[0]")
-				}
-			}},
-		{"flags after verb", []string{"sysext", "merge", "--force"},
-			func(t *testing.T, c *config) {
-				if c.verb != "merge" || !c.force {
-					t.Errorf("verb=%q force=%v", c.verb, c.force)
-				}
-			}},
-		{"combined", []string{"sysext", "--root=/x", "--json=short", "--no-legend", "list"},
-			func(t *testing.T, c *config) {
-				if c.root != "/x" || c.jsonMode != jsonShort || !c.noLegend || c.verb != "list" {
-					t.Errorf("got %+v", c)
-				}
-			}},
+		{[]string{"--root=/mnt/"}, func(c *config) bool { return c.root == "/mnt" && c.noReload }},
+		{[]string{"--root", "/mnt"}, func(c *config) bool { return c.root == "/mnt" && c.noReload }},
+		{[]string{"--root=rel/x"}, func(c *config) bool { return c.root == filepath.Join(cwd, "rel/x") && c.noReload }},
+		{[]string{"--root="}, func(c *config) bool { return c.root == "" && c.noReload }},
+		{[]string{"--root=/"}, func(c *config) bool { return c.root == "/" && c.noReload }},
+		{[]string{"--force"}, func(c *config) bool { return c.force }},
+		{[]string{"--for"}, func(c *config) bool { return c.force }},
+		{[]string{"--noexec=false"}, func(c *config) bool { return c.noExec == overlay.NoExecOff }},
+		{[]string{"--noexec", "yes"}, func(c *config) bool { return c.noExec == overlay.NoExecOn }},
+		{[]string{"--noe=on"}, func(c *config) bool { return c.noExec == overlay.NoExecOn }},
+		{[]string{"--json=short"}, func(c *config) bool { return c.jsonMode == jsonShort }},
+		{[]string{"--js", "pretty"}, func(c *config) bool { return c.jsonMode == jsonPretty }},
+		{[]string{"--no-reload"}, func(c *config) bool { return c.noReload }},
+		{[]string{"--no-r"}, func(c *config) bool { return c.noReload }},
+		{[]string{"--always-refresh=yes"}, func(c *config) bool { return c.alwaysRefresh }},
+		{[]string{"--always-refresh", "0"}, func(c *config) bool { return !c.alwaysRefresh }},
+		{[]string{"--no-pager", "--no-legend"}, func(c *config) bool { return !c.legend }},
+		{[]string{"--confext"}, func(c *config) bool { return c.class == release.Confext }},
+		{[]string{"--conf"}, func(c *config) bool { return c.class == release.Confext }},
+		{[]string{"--mutable=true"}, func(c *config) bool { return c.mutable == "yes" && c.mutableSet }},
+		{[]string{"--mutable=ephemeral-import"}, func(c *config) bool { return c.mutable == "ephemeral-import" }},
+		{[]string{"--image-policy=root=verity+signed:usr=absent"}, func(c *config) bool {
+			return c.imagePolicy == "root=verity+signed:usr=absent" && c.imagePolicySet
+		}},
+		{[]string{"--image-policy="}, func(c *config) bool { return c.imagePolicy == "-" && c.imagePolicySet }},
+		{[]string{"merge", "--force"}, func(c *config) bool { return c.force && len(c.args) == 1 && c.args[0] == "merge" }},
+		{[]string{"--", "--force"}, func(c *config) bool { return !c.force && len(c.args) == 1 && c.args[0] == "--force" }},
+		{[]string{"-"}, func(c *config) bool { return len(c.args) == 1 && c.args[0] == "-" }},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := parseArgs(tc.args)
-			if err != nil {
-				t.Fatalf("parseArgs(%v): %v", tc.args, err)
-			}
-			tc.check(t, cfg)
-		})
-	}
-}
-
-func TestParseArgsVerbs(t *testing.T) {
-	for _, verb := range []string{"status", "merge", "unmerge", "refresh", "list"} {
-		cfg, err := parseArgs([]string{"sysext", verb})
-		if err != nil {
-			t.Fatalf("verb %s: %v", verb, err)
+		c, done, err := parse(t, append([]string{"sysext"}, tc.args...)...)
+		if err != nil || done {
+			t.Errorf("parseArgs(%q): done=%v err=%v", tc.args, done, err)
+			continue
 		}
-		if cfg.verb != verb {
-			t.Errorf("verb = %q, want %q", cfg.verb, verb)
+		if !tc.check(c.cfg) {
+			t.Errorf("parseArgs(%q) = %+v", tc.args, c.cfg)
 		}
 	}
-}
-
-func TestParseArgsHelpVersion(t *testing.T) {
-	for _, args := range [][]string{
-		{"sysext", "-h"},
-		{"sysext", "--help"},
-		{"sysext", "merge", "-h"},
-	} {
-		cfg, err := parseArgs(args)
-		if err != nil {
-			t.Fatalf("parseArgs(%v): %v", args, err)
-		}
-		if !cfg.showHelp {
-			t.Errorf("parseArgs(%v): showHelp not set", args)
-		}
-	}
-	cfg, err := parseArgs([]string{"sysext", "--version"})
-	if err != nil {
-		t.Fatalf("--version: %v", err)
-	}
-	if !cfg.showVersion {
-		t.Error("showVersion not set")
+	if c, _, _ := parse(t, "/usr/bin/confext"); c.cfg.class != release.Confext || c.cfg.progName != "confext" {
+		t.Errorf("argv[0] confext: %+v", c.cfg)
 	}
 }
 
 func TestParseArgsErrors(t *testing.T) {
-	cases := []struct {
-		name    string
-		args    []string
-		errPart string
+	hermetic(t)
+	for _, tc := range []struct {
+		args []string
+		want string
 	}{
-		{"unknown long flag", []string{"sysext", "--bogus"}, "unrecognized option '--bogus'"},
-		{"unknown short flag", []string{"sysext", "-x"}, "unrecognized option '-x'"},
-		{"bool flag with value", []string{"sysext", "--force=1"}, "doesn't allow an argument"},
-		{"value flag missing value", []string{"sysext", "--root"}, "requires an argument"},
-		{"json missing value", []string{"sysext", "--json"}, "requires an argument"},
-		{"bad json mode", []string{"sysext", "--json=banana"}, "unknown JSON output format"},
-		{"bad noexec", []string{"sysext", "--noexec=banana"}, "noexec"},
-		{"bad always-refresh", []string{"sysext", "--always-refresh=maybe"}, "always-refresh"},
-		{"unknown verb", []string{"sysext", "frobnicate"}, "unknown command verb 'frobnicate'"},
-		{"too many args", []string{"sysext", "merge", "unmerge"}, "too many arguments"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := parseArgs(tc.args)
-			if err == nil {
-				t.Fatalf("parseArgs(%v): expected error", tc.args)
-			}
-			if !strings.Contains(err.Error(), tc.errPart) {
-				t.Errorf("error %q does not contain %q", err, tc.errPart)
-			}
-		})
-	}
-}
-
-func TestParseBool(t *testing.T) {
-	for _, s := range []string{"1", "yes", "y", "true", "t", "on", "YES", "True"} {
-		b, err := parseBool(s)
-		if err != nil || !b {
-			t.Errorf("parseBool(%q) = %v, %v; want true, nil", s, b, err)
+		{[]string{"--bogus"}, "sysext: unrecognized option '--bogus'"},
+		{[]string{"--bogus=1"}, "sysext: unrecognized option '--bogus'"},
+		{[]string{"--=x"}, "sysext: unrecognized option '--'"},
+		{[]string{"-x"}, "sysext: unrecognized option '-x'"},
+		{[]string{"-xh"}, "sysext: unrecognized option '-x'"},
+		{[]string{"--force=1"}, "sysext: option '--force' doesn't allow an argument"},
+		{[]string{"--for=1"}, "sysext: option '--for' doesn't allow an argument"},
+		{[]string{"--root"}, "sysext: option '--root' requires an argument"},
+		{[]string{"--no"}, "sysext: option '--no' is ambiguous; possibilities: --noexec, --no-reload, --no-pager, --no-legend"},
+		{[]string{"--no-"}, "sysext: option '--no-' is ambiguous; possibilities: --no-reload, --no-pager, --no-legend"},
+		{[]string{"--i"}, "sysext: option '--i' is ambiguous; possibilities: --image-policy, --introspect-cli"},
+		{[]string{"--json=banana"}, "Unknown argument to --json= switch: banana"},
+		{[]string{"--noexec=banana"}, "Failed to parse boolean argument to '--noexec': banana"},
+		{[]string{"--always-refresh=maybe"}, "Failed to parse boolean argument to '--always-refresh': maybe"},
+		{[]string{"--mutable=banana"}, "Failed to parse argument to --mutable=: banana"},
+		{[]string{"--image-policy=garbage"}, "Failed to parse image policy: garbage"},
+		{[]string{"--image-policy=root=verity:root=signed"}, "Duplicate rule in image policy: root=verity:root=signed"},
+		{[]string{"--image-policy=foo=verity"}, "Unknown partition type in image policy: foo=verity"},
+		{[]string{"--image-policy=root=bogus"}, "Unknown partition policy flag in image policy: root=bogus"},
+	} {
+		_, _, err := parse(t, append([]string{"sysext"}, tc.args...)...)
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("parseArgs(%q) = %v, want %q", tc.args, err, tc.want)
 		}
 	}
-	for _, s := range []string{"0", "no", "n", "false", "f", "off", "NO", "False"} {
-		b, err := parseBool(s)
-		if err != nil || b {
-			t.Errorf("parseBool(%q) = %v, %v; want false, nil", s, b, err)
+	if _, _, err := parse(t, "/usr/bin/confext", "--bogus"); err == nil || err.Error() != "confext: unrecognized option '--bogus'" {
+		t.Errorf("confext prefix: %v", err)
+	}
+}
+
+const sysextHelp = `> sysext [OPTION…] COMMAND …
+
+Merge system extension images into /usr/ and /opt/.
+
+Commands:
+  [status]                 Show current merge status (default)
+  merge                    Merge extensions into relevant hierarchies
+  unmerge                  Unmerge extensions from relevant hierarchies
+  refresh                  Unmerge/merge extensions again
+  list                     List installed extensions
+
+Options:
+  -h --help                Show this help
+     --version             Show package version
+     --root=PATH           Operate relative to root PATH
+     --mutable=MODE        Specify a mutability mode (yes, no, auto, import,
+                           ephemeral, ephemeral-import, help)
+     --image-policy=POLICY Specify disk image dissection policy
+     --noexec=BOOL         Whether to mount extension overlay with noexec
+     --force               Ignore version incompatibilities
+     --no-reload           Do not reload the service manager (OpenRC)
+     --always-refresh=BOOL Whether to refresh when no changes were found
+     --no-pager            Do not start a pager
+     --no-legend           Do not show headers and footers
+     --json=FORMAT         Generate JSON output (pretty, short, or off)
+     --confext             Operate on configuration extensions in /etc/
+
+See the systemd-sysext(8) man page for details.
+`
+
+func TestHelp(t *testing.T) {
+	hermetic(t)
+	for _, args := range [][]string{
+		{"sysext", "--help"}, {"sysext", "-h"}, {"sysext", "-hx"}, {"sysext", "--he"},
+		{"sysext", "help"}, {"sysext", "help", "extra"}, {"sysext", "merge", "-h"},
+	} {
+		stdout, stderr, rc := runCLI(t, args...)
+		if rc != 0 || stderr != "" || stdout != sysextHelp {
+			t.Errorf("%q: rc=%d stderr=%q stdout:\n%s", args, rc, stderr, stdout)
 		}
 	}
-	if _, err := parseBool("maybe"); err == nil {
-		t.Error("parseBool(maybe) should fail")
+	// Options are handled in order: an error before --help wins.
+	if _, stderr, rc := runCLI(t, "sysext", "--json=bogus", "--help"); rc != 1 || stderr != "Unknown argument to --json= switch: bogus\n" {
+		t.Errorf("error before --help: rc=%d %q", rc, stderr)
+	}
+
+	stdout, _, _ := runCLI(t, "/usr/bin/confext", "--help")
+	want := strings.NewReplacer(
+		"> sysext", "> confext",
+		"Merge system extension images into /usr/ and /opt/.", "Merge configuration extension images into /etc/.",
+		"systemd-sysext(8)", "systemd-confext(8)",
+	).Replace(sysextHelp)
+	if stdout != want {
+		t.Errorf("confext help:\n%s", stdout)
+	}
+
+	t.Setenv("SYSTEMD_INVOKED_AS", "/usr/bin/systemd-sysext")
+	if stdout, _, _ := runCLI(t, "sysext", "-h"); !strings.HasPrefix(stdout, "> systemd-sysext [OPTION…] COMMAND …\n") {
+		t.Errorf("$SYSTEMD_INVOKED_AS names the program: %q", stdout)
+	}
+	t.Setenv("COLUMNS", "200")
+	if stdout, _, _ := runCLI(t, "sysext", "-h"); !strings.Contains(stdout, "(yes, no, auto, import, ephemeral, ephemeral-import, help)\n") {
+		t.Errorf("wide terminal must not wrap:\n%s", stdout)
 	}
 }
 
-func TestRunHelpAndVersion(t *testing.T) {
-	var out, errBuf bytes.Buffer
-	if err := runWith([]string{"sysext", "--help"}, &out, &errBuf); err != nil {
-		t.Fatalf("--help: %v", err)
-	}
-	for _, want := range []string{"Commands:", "Options:", "merge", "--json=pretty|short|off", "/usr/ and /opt/"} {
-		if !strings.Contains(out.String(), want) {
-			t.Errorf("help output missing %q:\n%s", want, out.String())
-		}
-	}
-
-	out.Reset()
-	if err := runWith([]string{"confext", "-h"}, &out, &errBuf); err != nil {
-		t.Fatalf("confext -h: %v", err)
-	}
-	if !strings.Contains(out.String(), "/etc/") {
-		t.Errorf("confext help should mention /etc/:\n%s", out.String())
-	}
-
-	out.Reset()
-	if err := runWith([]string{"sysext", "--version"}, &out, &errBuf); err != nil {
-		t.Fatalf("--version: %v", err)
-	}
-	if !strings.Contains(out.String(), version) {
-		t.Errorf("version output %q missing %q", out.String(), version)
-	}
-}
-
-func TestRunBadFlag(t *testing.T) {
-	var out, errBuf bytes.Buffer
-	err := runWith([]string{"sysext", "--nope"}, &out, &errBuf)
-	if err == nil || !strings.Contains(err.Error(), "unrecognized option") {
-		t.Errorf("expected unrecognized option error, got %v", err)
-	}
-}
-
-func TestFormatTable(t *testing.T) {
-	header := []string{"HIERARCHY", "EXTENSIONS", "SINCE"}
-	rows := [][]string{
-		{"/usr", "foo,bar", "Wed 2026-06-10 10:00:00 UTC"},
-		{"/opt", "none", "-"},
-	}
-	got := formatTable(header, rows, false)
-	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
-	if len(lines) != 3 {
-		t.Fatalf("want 3 lines, got %d:\n%s", len(lines), got)
-	}
-	if !strings.HasPrefix(lines[0], "HIERARCHY ") {
-		t.Errorf("header misformatted: %q", lines[0])
-	}
-	// Columns must align: EXTENSIONS starts at the same offset everywhere.
-	idx := strings.Index(lines[0], "EXTENSIONS")
-	if strings.Index(lines[1], "foo,bar") != idx || strings.Index(lines[2], "none") != idx {
-		t.Errorf("columns not aligned:\n%s", got)
-	}
-	// Last column unpadded: no trailing spaces.
-	for i, l := range lines {
-		if strings.TrimRight(l, " ") != l {
-			t.Errorf("line %d has trailing spaces: %q", i, l)
-		}
-	}
-
-	// --no-legend drops the header.
-	got = formatTable(header, rows, true)
-	if strings.Contains(got, "HIERARCHY") {
-		t.Errorf("no-legend output contains header:\n%s", got)
-	}
-	if !strings.Contains(got, "/usr") {
-		t.Errorf("no-legend output missing rows:\n%s", got)
-	}
-
-	if formatTable(header, nil, true) != "" {
-		t.Error("empty table with no legend should render empty")
-	}
-}
-
-func TestStatusRows(t *testing.T) {
-	statuses := []overlay.Status{
-		{Hierarchy: "/usr", Merged: true, Extensions: []string{"foo", "bar"}, Since: 1700000000},
-		{Hierarchy: "/opt", Merged: false},
-	}
-	rows := statusRows(statuses)
-	if len(rows) != 2 {
-		t.Fatalf("want 2 rows, got %d", len(rows))
-	}
-	if rows[0][0] != "/usr" || rows[0][1] != "foo,bar" {
-		t.Errorf("merged row wrong: %v", rows[0])
-	}
-	if !strings.Contains(rows[0][2], "2023") {
-		t.Errorf("SINCE should contain the year: %q", rows[0][2])
-	}
-	if rows[1][0] != "/opt" || rows[1][1] != "none" || rows[1][2] != "-" {
-		t.Errorf("unmerged row wrong: %v", rows[1])
-	}
-}
-
-// TestStatusJSONGolden pins the systemd-compatible status JSON byte-for-byte
-// (--json=short; systemd 260 field order hierarchy, extensions, since).
-func TestStatusJSONGolden(t *testing.T) {
-	// Unmerged, as captured from systemd 260: extensions is the string
-	// "none", since is null, hierarchies sorted alphabetically.
-	unmerged := []overlay.Status{
-		{Hierarchy: "/usr", Merged: false},
-		{Hierarchy: "/opt", Merged: false},
-	}
-	sortStatuses(unmerged)
-	got, err := renderJSON(toStatusJSON(unmerged), jsonShort)
-	if err != nil {
-		t.Fatalf("renderJSON: %v", err)
-	}
-	want := `[{"hierarchy":"/opt","extensions":"none","since":null},` +
-		`{"hierarchy":"/usr","extensions":"none","since":null}]` + "\n"
-	if got != want {
-		t.Errorf("unmerged JSON:\n got %q\nwant %q", got, want)
-	}
-
-	// Merged: extensions is an array of names, since is a usec timestamp.
-	merged := []overlay.Status{
-		{Hierarchy: "/usr", Merged: true, Extensions: []string{"foo", "bar"}, Since: 1700000000},
-		{Hierarchy: "/opt", Merged: false},
-	}
-	sortStatuses(merged)
-	got, err = renderJSON(toStatusJSON(merged), jsonShort)
-	if err != nil {
-		t.Fatalf("renderJSON: %v", err)
-	}
-	want = `[{"hierarchy":"/opt","extensions":"none","since":null},` +
-		`{"hierarchy":"/usr","extensions":["foo","bar"],"since":1700000000000000}]` + "\n"
-	if got != want {
-		t.Errorf("merged JSON:\n got %q\nwant %q", got, want)
-	}
-
-	// No "merged" key in any element.
-	var decoded []map[string]any
-	if err := json.Unmarshal([]byte(got), &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	for _, el := range decoded {
-		if _, ok := el["merged"]; ok {
-			t.Errorf("JSON element must not have a 'merged' key: %v", el)
-		}
-	}
-
-	// Pretty mode stays valid JSON with the same data.
-	pretty, err := renderJSON(toStatusJSON(merged), jsonPretty)
-	if err != nil {
-		t.Fatalf("renderJSON pretty: %v", err)
-	}
-	if !strings.Contains(pretty, "\n  ") {
-		t.Errorf("pretty JSON should be indented: %q", pretty)
-	}
-	var decodedPretty []map[string]any
-	if err := json.Unmarshal([]byte(pretty), &decodedPretty); err != nil {
-		t.Fatalf("pretty JSON invalid: %v", err)
-	}
-}
-
-// Merged hierarchy with an empty recorded extension list still renders the
-// string "none", and a zero Since renders null.
-func TestStatusJSONMergedEmpty(t *testing.T) {
-	statuses := []overlay.Status{{Hierarchy: "/etc", Merged: true}}
-	got, err := renderJSON(toStatusJSON(statuses), jsonShort)
-	if err != nil {
-		t.Fatalf("renderJSON: %v", err)
-	}
-	want := `[{"hierarchy":"/etc","extensions":"none","since":null}]` + "\n"
-	if got != want {
-		t.Errorf("got %q, want %q", got, want)
-	}
-}
-
-func TestSortStatuses(t *testing.T) {
-	statuses := []overlay.Status{
-		{Hierarchy: "/usr"}, {Hierarchy: "/opt"}, {Hierarchy: "/etc"},
-	}
-	sortStatuses(statuses)
-	want := []string{"/etc", "/opt", "/usr"}
-	for i, s := range statuses {
-		if s.Hierarchy != want[i] {
-			t.Fatalf("sortStatuses order = %v, want %v", statuses, want)
-		}
-	}
-}
-
-// TestListJSONGolden pins the systemd-compatible list JSON byte-for-byte:
-// lowercased table-column keys name/type/path/time, time in usec.
-func TestListJSONGolden(t *testing.T) {
-	images := []discover.Image{
-		{Name: "foo", Path: "/var/lib/extensions/foo.raw", Type: discover.TypeRaw, ModTime: 1700000000},
-		{Name: "bar", Path: "/etc/extensions/bar", Type: discover.TypeDirectory, ModTime: 1700000001},
-	}
-	out, err := renderJSON(toListEntries(images), jsonShort)
-	if err != nil {
-		t.Fatalf("renderJSON: %v", err)
-	}
-	want := `[{"name":"foo","type":"raw","path":"/var/lib/extensions/foo.raw","time":1700000000000000},` +
-		`{"name":"bar","type":"directory","path":"/etc/extensions/bar","time":1700000001000000}]` + "\n"
-	if out != want {
-		t.Errorf("list JSON:\n got %q\nwant %q", out, want)
-	}
-
-	// Empty list must encode as [], not null.
-	out, err = renderJSON(toListEntries(nil), jsonShort)
-	if err != nil {
-		t.Fatalf("renderJSON empty: %v", err)
-	}
-	if strings.TrimSpace(out) != "[]" {
-		t.Errorf("empty list JSON = %q, want []", out)
-	}
-}
-
-func TestListRows(t *testing.T) {
-	entries := toListEntries([]discover.Image{
-		{Name: "foo", Path: "/p/foo.raw", Type: discover.TypeRaw, ModTime: 1700000000},
-		{Name: "zero", Path: "/p/zero", Type: discover.TypeDirectory, ModTime: 0},
-	})
-	rows := listRows(entries)
-	if rows[0][0] != "foo" || rows[0][1] != "raw" || rows[0][2] != "/p/foo.raw" {
-		t.Errorf("row wrong: %v", rows[0])
-	}
-	if !strings.Contains(rows[0][3], "2023") {
-		t.Errorf("TIME should contain year: %q", rows[0][3])
-	}
-	if rows[1][3] != "-" {
-		t.Errorf("zero mtime should render '-': %q", rows[1][3])
-	}
-}
-
-func TestImageTypeString(t *testing.T) {
-	if got := imageTypeString(discover.TypeDirectory); got != "directory" {
-		t.Errorf("TypeDirectory = %q", got)
-	}
-	if got := imageTypeString(discover.TypeRaw); got != "raw" {
-		t.Errorf("TypeRaw = %q", got)
-	}
-	if got := imageTypeString(discover.ImageType(99)); got != "unknown" {
-		t.Errorf("bogus type = %q", got)
-	}
-}
-
-func TestShouldSkipRefresh(t *testing.T) {
-	cases := []struct {
-		name       string
-		discovered []string
-		mergedSets [][]string
-		always     bool
-		want       bool
+func TestPrintingOptions(t *testing.T) {
+	hermetic(t)
+	modes := "no\nyes\nauto\nimport\nephemeral\nephemeral-import\n"
+	for _, tc := range []struct {
+		args []string
+		want string
 	}{
-		{"identical single hierarchy", []string{"a", "b"},
-			[][]string{{"a", "b"}, nil}, false, true},
-		{"identical all hierarchies", []string{"a", "b"},
-			[][]string{{"a", "b"}, {"a", "b"}}, false, true},
-		{"always-refresh forces", []string{"a", "b"},
-			[][]string{{"a", "b"}}, true, false},
-		{"nothing merged", []string{"a", "b"},
-			[][]string{nil, nil}, false, false},
-		{"different set", []string{"a", "b"},
-			[][]string{{"a"}}, false, false},
-		{"different order", []string{"a", "b"},
-			[][]string{{"b", "a"}}, false, false},
-		{"extra merged extension", []string{"a"},
-			[][]string{{"a", "b"}}, false, false},
-		{"one hierarchy stale", []string{"a", "b"},
-			[][]string{{"a", "b"}, {"a"}}, false, false},
-		{"no hierarchies", []string{"a"}, nil, false, false},
+		{[]string{"--mutable=help"}, "Known mutability modes:\n" + modes},
+		{[]string{"--mutable=help", "--no-legend"}, "Known mutability modes:\n" + modes},
+		{[]string{"--no-legend", "--mutable=help"}, modes},
+		{[]string{"--json=help"}, "pretty\nshort\noff\n"},
+		{[]string{"--version"}, "sysext-alpine " + version + " (systemd-sysext 262)\n"},
+	} {
+		stdout, stderr, rc := runCLI(t, append([]string{"sysext"}, tc.args...)...)
+		if rc != 0 || stderr != "" || stdout != tc.want {
+			t.Errorf("%q: rc=%d stderr=%q stdout=%q, want %q", tc.args, rc, stderr, stdout, tc.want)
+		}
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := shouldSkipRefresh(tc.discovered, tc.mergedSets, tc.always)
-			if got != tc.want {
-				t.Errorf("shouldSkipRefresh(%v, %v, %v) = %v, want %v",
-					tc.discovered, tc.mergedSets, tc.always, got, tc.want)
-			}
-		})
+	stdout, _, rc := runCLI(t, "sysext", "--introspect-cli")
+	for _, want := range []string{
+		`{"mediaType":"application/vnd.io.systemd.cli-introspection-0","commands":[{"names":["sysext"],"project":"sysext-alpine",`,
+		`{"names":["status"],"abstract":["Show current merge status (default)"],"maxArguments":1,"isDefault":true}`,
+		`{"names":["--root"],"argument":"required_argument","metavar":"PATH","help":"Operate relative to root PATH"}`,
+		`{"names":["--introspect-cli"],"argument":"no_argument"}`,
+		`{"names":["help"]}]},{"names":["confext"]`,
+	} {
+		if rc != 0 || !strings.Contains(stdout, want) {
+			t.Errorf("--introspect-cli lacks %s:\n%s", want, stdout)
+		}
 	}
 }
 
-func TestFormatTimestamp(t *testing.T) {
-	got := formatTimestamp(1700000000) // 2023-11-14/15 depending on zone
-	if !strings.Contains(got, "2023") {
-		t.Errorf("formatTimestamp = %q, want year 2023", got)
+func TestVerbErrors(t *testing.T) {
+	hermetic(t)
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"frob"}, "Unknown command verb 'frob', did you mean 'merge'?\n"},
+		{[]string{"stat"}, "Unknown command verb 'stat', did you mean 'status'?\n"},
+		{[]string{"-"}, "Unknown command verb '-', did you mean 'list'?\n"},
+		{[]string{"refrseh"}, "Unknown command verb 'refrseh', did you mean 'refresh'?\n"},
+		{[]string{"supercalifragilistic"}, "Unknown command verb 'supercalifragilistic'.\n"},
+		{[]string{"merge", "unmerge"}, "Too many arguments.\n"},
+		{[]string{"status", "x"}, "Too many arguments.\n"},
+	} {
+		stdout, stderr, rc := runCLI(t, append([]string{"sysext"}, tc.args...)...)
+		if rc != 1 || stdout != "" || stderr != tc.want {
+			t.Errorf("%q: rc=%d stdout=%q stderr=%q, want %q", tc.args, rc, stdout, stderr, tc.want)
+		}
 	}
 }
 
-// parseArgs must record whether --mutable/--image-policy were given
-// explicitly, so file configuration only applies when they were not.
-func TestParseArgsExplicitTracking(t *testing.T) {
-	cfg, err := parseArgs([]string{"sysext"})
-	if err != nil {
+func TestLevenshtein(t *testing.T) {
+	for _, tc := range []struct {
+		x, y string
+		want int
+	}{
+		{"", "", 0}, {"abc", "", 3}, {"", "ab", 2}, {"merge", "merge", 0},
+		{"merge", "mrege", 1}, {"status", "stat", 2}, {"list", "-", 4}, {"merge", "frob", 4},
+	} {
+		if got := levenshtein(tc.x, tc.y); got != tc.want {
+			t.Errorf("levenshtein(%q, %q) = %d, want %d", tc.x, tc.y, got, tc.want)
+		}
+	}
+}
+
+func TestLogLevel(t *testing.T) {
+	hermetic(t)
+	for _, tc := range []struct {
+		env   string
+		level int
+		warn  bool
+	}{
+		{"debug", logDebug, false},
+		{"4", logWarning, false},
+		{"notice", logNotice, false},
+		{"err", logErr, false},
+		{"console:debug", logInfo, false},
+		{"console:debug,debug", logDebug, false},
+		{"debug,console:err", logErr, false},
+		{"kmsg:err", logInfo, false},
+		{"bogus", logInfo, true},
+		{"8", logInfo, true},
+		{"foo:err", logInfo, true},
+	} {
+		t.Setenv("SYSTEMD_LOG_LEVEL", tc.env)
+		var stderr bytes.Buffer
+		l := newLogger(&stderr)
+		want := ""
+		if tc.warn {
+			want = "Failed to parse log level '" + tc.env + "', ignoring: Invalid argument\n"
+		}
+		if l.level != tc.level || stderr.String() != want {
+			t.Errorf("SYSTEMD_LOG_LEVEL=%s: level %d stderr %q, want %d %q", tc.env, l.level, stderr.String(), tc.level, want)
+		}
+	}
+	os.Unsetenv("SYSTEMD_LOG_LEVEL")
+	t.Setenv("DEBUG_INVOCATION", "1")
+	if l := newLogger(&bytes.Buffer{}); l.level != logDebug {
+		t.Error("DEBUG_INVOCATION=1 must enable debug logging")
+	}
+
+	var b bytes.Buffer
+	l := &logger{w: &b, level: logNotice}
+	l.Debugf("d")
+	l.Infof("i")
+	l.Noticef("n")
+	l.Warnf("w %d", 1)
+	l.Errorf("e")
+	if b.String() != "n\nw 1\ne\n" {
+		t.Errorf("filtered output = %q", b.String())
+	}
+}
+
+func TestKillSwitch(t *testing.T) {
+	hermetic(t)
+	root := t.TempDir()
+	notice := "Disabled by the kernel command line option 'systemd.sysext=', skipping execution.\n"
+	t.Setenv("SYSTEMD_PROC_CMDLINE", "quiet systemd.sysext=0")
+
+	stdout, stderr, rc := runCLI(t, "sysext", "--root="+root, "status")
+	if rc != 0 || stderr != "" || !strings.HasPrefix(stdout, "HIERARCHY") {
+		t.Errorf("manual invocation must not be affected: rc=%d %q %q", rc, stdout, stderr)
+	}
+	t.Setenv("RC_SVCNAME", "sysext")
+	for _, args := range [][]string{{"status"}, {"merge"}, {"frob"}, {"list", "x"}} {
+		stdout, stderr, rc := runCLI(t, append([]string{"sysext", "--root=" + root}, args...)...)
+		if rc != 0 || stdout != "" || stderr != notice {
+			t.Errorf("%q under OpenRC: rc=%d stdout=%q stderr=%q", args, rc, stdout, stderr)
+		}
+	}
+	if stdout, _, rc := runCLI(t, "sysext", "--json=help"); rc != 0 || stdout == "" {
+		t.Error("options are handled before the kill switch")
+	}
+	if _, stderr, _ := runCLI(t, "confext", "--root="+root, "status"); stderr != "" {
+		t.Errorf("systemd.sysext= does not disable confext: %q", stderr)
+	}
+	t.Setenv("SYSTEMD_PROC_CMDLINE", "systemd.confext=no")
+	if _, stderr, rc := runCLI(t, "confext", "--root="+root, "status"); rc != 0 ||
+		stderr != "Disabled by the kernel command line option 'systemd.confext=', skipping execution.\n" {
+		t.Errorf("confext: rc=%d %q", rc, stderr)
+	}
+	t.Setenv("SYSTEMD_PROC_CMDLINE", "systemd.sysext=0 systemd.sysext=1")
+	if _, stderr, _ := runCLI(t, "sysext", "--root="+root, "status"); stderr != "" {
+		t.Errorf("last value wins: %q", stderr)
+	}
+	t.Setenv("SYSTEMD_PROC_CMDLINE", "systemd.sysext=banana")
+	t.Setenv("SYSTEMD_LOG_LEVEL", "debug")
+	if _, stderr, rc := runCLI(t, "sysext", "--root="+root, "status"); rc != 0 ||
+		!strings.HasPrefix(stderr, "Failed to check 'systemd.sysext=' kernel command line option, proceeding: Invalid argument\n") {
+		t.Errorf("invalid value proceeds: rc=%d %q", rc, stderr)
+	}
+	os.Unsetenv("SYSTEMD_LOG_LEVEL")
+
+	t.Setenv("SYSTEMD_IN_INITRD", "1")
+	t.Setenv("SYSTEMD_PROC_CMDLINE", "rd.systemd.sysext=0")
+	if _, stderr, _ := runCLI(t, "sysext", "list"); stderr != "Disabled by the kernel command line option 'rd.systemd.sysext=', skipping execution.\n" {
+		t.Errorf("initrd uses the rd. switch: %q", stderr)
+	}
+	if _, stderr, _ := runCLI(t, "sysext", "--root="+root, "list"); stderr != "No OS extensions found.\n" {
+		t.Errorf("with --root= the rd. switch does not apply: %q", stderr)
+	}
+}
+
+func TestStatusAndListRoot(t *testing.T) {
+	hermetic(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "usr"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.mutableSet || cfg.imagePolicySet {
-		t.Error("mutableSet/imagePolicySet must default to false")
+	stdout, stderr, rc := runCLI(t, "sysext", "--root="+root, "status")
+	if rc != 0 || stderr != "" || stdout != "HIERARCHY EXTENSIONS SINCE\n/usr      -          -\n" {
+		t.Errorf("status: rc=%d stderr=%q stdout:\n%s", rc, stderr, stdout)
 	}
-	if cfg.mutable != "" || cfg.imagePolicy != "" {
-		t.Errorf("unset options should be empty before config is applied, got mutable=%q imagePolicy=%q",
-			cfg.mutable, cfg.imagePolicy)
+	stdout, _, _ = runCLI(t, "sysext", "--root="+root, "status", "--json=short")
+	if stdout != `[{"hierarchy":"/usr","extensions":[],"since":null}]`+"\n" {
+		t.Errorf("status json = %q", stdout)
+	}
+	t.Setenv("SYSTEMD_SYSEXT_HIERARCHIES", "/usr:/nonexistent")
+	if stdout, _, _ = runCLI(t, "sysext", "--root="+root, "--no-legend"); stdout != "/usr - -\n" {
+		t.Errorf("missing hierarchies are left out: %q", stdout)
+	}
+	t.Setenv("SYSTEMD_SYSEXT_HIERARCHIES", "relative")
+	if _, stderr, rc = runCLI(t, "sysext", "--root="+root, "status"); rc != 1 || stderr != "Failed to determine sysext hierarchies: Invalid argument\n" {
+		t.Errorf("invalid hierarchies: rc=%d %q", rc, stderr)
+	}
+	if _, stderr, rc = runCLI(t, "sysext", "--root="+root, "list"); rc != 0 || stderr != "No OS extensions found.\n" {
+		t.Errorf("list does not need hierarchies: rc=%d %q", rc, stderr)
+	}
+	os.Unsetenv("SYSTEMD_SYSEXT_HIERARCHIES")
+
+	stdout, stderr, rc = runCLI(t, "sysext", "--root="+root, "list")
+	if rc != 0 || stdout != "" || stderr != "No OS extensions found.\n" {
+		t.Errorf("empty list: rc=%d stdout=%q stderr=%q", rc, stdout, stderr)
+	}
+	if stdout, stderr, _ = runCLI(t, "sysext", "--root="+root, "list", "--json=pretty"); stdout != "[]\n" || stderr != "" {
+		t.Errorf("empty list json: %q %q", stdout, stderr)
 	}
 
-	cfg, err = parseArgs([]string{"sysext", "--mutable=auto", "--image-policy=root=verity"})
-	if err != nil {
-		t.Fatal(err)
+	missing := filepath.Join(root, "missing")
+	if _, stderr, rc = runCLI(t, "sysext", "--root="+missing, "list"); rc != 1 || stderr != "Failed to discover images: No such file or directory\n" {
+		t.Errorf("list on a missing root: rc=%d %q", rc, stderr)
 	}
-	if !cfg.mutableSet || cfg.mutable != "auto" {
-		t.Errorf("mutable = %q (set=%v), want auto (set)", cfg.mutable, cfg.mutableSet)
-	}
-	if !cfg.imagePolicySet || cfg.imagePolicy != "root=verity" {
-		t.Errorf("imagePolicy = %q (set=%v), want root=verity (set)", cfg.imagePolicy, cfg.imagePolicySet)
+	stdout, stderr, rc = runCLI(t, "sysext", "--root="+missing, "status")
+	wantErr := "Failed to open root directory '" + missing + "': No such file or directory\n" +
+		"Failed to parse sysext config file, ignoring: No such file or directory\n"
+	if rc != 0 || stdout != "HIERARCHY EXTENSIONS SINCE\n" || stderr != wantErr {
+		t.Errorf("status on a missing root: rc=%d stdout=%q stderr=%q", rc, stdout, stderr)
 	}
 }
 
-// applyFileConfig: defaults flow config -> overridden by explicit CLI flags.
-func TestApplyFileConfig(t *testing.T) {
-	cases := []struct {
-		name            string
-		cfg             config
-		file            extconf.Config
-		wantMutable     string
-		wantImagePolicy string
-		wantErr         bool
-	}{
-		{"all unset -> builtin defaults",
-			config{}, extconf.Config{}, "no", "", false},
-		{"config supplies both",
-			config{}, extconf.Config{Mutable: "auto", ImagePolicy: "root=verity"},
-			"auto", "root=verity", false},
-		{"explicit flags beat config",
-			config{mutable: "yes", mutableSet: true, imagePolicy: "cli", imagePolicySet: true},
-			extconf.Config{Mutable: "auto", ImagePolicy: "conf"},
-			"yes", "cli", false},
-		{"flag beats config per option",
-			config{mutable: "import", mutableSet: true},
-			extconf.Config{Mutable: "auto", ImagePolicy: "conf"},
-			"import", "conf", false},
-		{"config boolean spelling normalized",
-			config{}, extconf.Config{Mutable: "true"}, "yes", "", false},
-		{"config mutable=help rejected",
-			config{}, extconf.Config{Mutable: "help"}, "", "", true},
-		{"config invalid mutable rejected",
-			config{}, extconf.Config{Mutable: "banana"}, "", "", true},
+func TestLoadContext(t *testing.T) {
+	hermetic(t)
+	root := t.TempDir()
+	writeFile(t, root, "etc/systemd/sysext.conf", "[SysExt]\nMutable=ephemeral\nImagePolicy=root=verity+bogus:bogus=open\n")
+	ctx := func(args ...string) (*cli, string) {
+		t.Helper()
+		var stderr bytes.Buffer
+		c := &cli{stdout: &bytes.Buffer{}, log: &logger{w: &stderr, level: logInfo}}
+		if _, err := c.parseArgs(append([]string{"sysext", "--root=" + root}, args...)); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.loadContext(); err != nil {
+			t.Fatal(err)
+		}
+		return c, stderr.String()
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := tc.cfg
-			err := applyFileConfig(&cfg, tc.file)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("expected error")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("applyFileConfig: %v", err)
-			}
-			if cfg.mutable != tc.wantMutable {
-				t.Errorf("mutable = %q, want %q", cfg.mutable, tc.wantMutable)
-			}
-			if cfg.imagePolicy != tc.wantImagePolicy {
-				t.Errorf("imagePolicy = %q, want %q", cfg.imagePolicy, tc.wantImagePolicy)
-			}
-		})
+
+	c, stderr := ctx()
+	if c.cfg.mutable != "ephemeral" || c.cfg.imagePolicy != "=ignore:root=verity" || stderr != "" {
+		t.Errorf("config: mutable=%q policy=%q stderr=%q", c.cfg.mutable, c.cfg.imagePolicy, stderr)
+	}
+	if len(c.hierarchies) != 2 || c.mountOptions != nil {
+		t.Errorf("hierarchies=%q mountOptions=%v", c.hierarchies, c.mountOptions)
+	}
+
+	t.Setenv("SYSTEMD_SYSEXT_OVERLAYFS_MOUNT_OPTIONS", "")
+	if c, _ = ctx(); c.mountOptions == nil || *c.mountOptions != "" {
+		t.Errorf("empty mount options from the environment = %v, want set and empty", c.mountOptions)
+	}
+	t.Setenv("SYSTEMD_SYSEXT_MUTABLE_MODE", "no")
+	t.Setenv("SYSTEMD_SYSEXT_OVERLAYFS_MOUNT_OPTIONS", "xino=off")
+	if c, _ = ctx(); c.cfg.mutable != "no" || c.mountOptions == nil || *c.mountOptions != "xino=off" {
+		t.Errorf("environment beats config: %q %v", c.cfg.mutable, c.mountOptions)
+	}
+	if c, _ = ctx("--mutable=auto", "--image-policy=*"); c.cfg.mutable != "auto" || c.cfg.imagePolicy != "*" {
+		t.Errorf("command line beats environment: %q %q", c.cfg.mutable, c.cfg.imagePolicy)
+	}
+	t.Setenv("SYSTEMD_SYSEXT_MUTABLE_MODE", "bogus")
+	c, stderr = ctx()
+	if c.cfg.mutable != "ephemeral" || stderr != "Failed to parse SYSTEMD_SYSEXT_MUTABLE_MODE environment variable value 'bogus'. Ignoring.\n" {
+		t.Errorf("invalid environment value: %q %q", c.cfg.mutable, stderr)
+	}
+	t.Setenv("SYSTEMD_SYSEXT_MUTABLE_MODE", "help")
+	if _, stderr = ctx("--mutable=yes"); !strings.Contains(stderr, "value 'help'. Ignoring.") {
+		t.Errorf("the environment is checked even with --mutable=: %q", stderr)
+	}
+	t.Setenv("SYSTEMD_CONFEXT_MUTABLE_MODE", "yes")
+	os.Unsetenv("SYSTEMD_SYSEXT_MUTABLE_MODE")
+	if c, _ = ctx(); c.cfg.mutable != "ephemeral" {
+		t.Errorf("sysext must not read SYSTEMD_CONFEXT_MUTABLE_MODE: %q", c.cfg.mutable)
+	}
+
+	writeFile(t, root, "etc/systemd/sysext.conf", "[SysExt]\nMutable=banana\n")
+	c, stderr = ctx()
+	if c.cfg.mutable != "no" || stderr != "/etc/systemd/sysext.conf:2: Failed to parse Mutable=banana, ignoring: Invalid argument\n" {
+		t.Errorf("invalid config value: %q %q", c.cfg.mutable, stderr)
+	}
+	writeFile(t, root, "etc/systemd/sysext.conf", "[SysExt]\nMutable=yes\nImagePolicy=root=verity:root=signed\n")
+	if c, stderr = ctx(); c.cfg.mutable != "no" || !strings.HasSuffix(stderr, "Failed to parse sysext config file, ignoring: Name not unique on network\n") {
+		t.Errorf("an invalid policy discards the whole config: %q %q", c.cfg.mutable, stderr)
 	}
 }
 
-// End-to-end flag-vs-config precedence through runWith: a config file under
-// --root sets Mutable=, an explicit flag must still win. Exercised via
-// `--mutable=help`-free verbs that do not touch mounts: we only check that
-// config loading errors surface (invalid Mutable=) and valid configs do not
-// break the status verb's argument handling.
-func TestRunConfigMutableInvalid(t *testing.T) {
+func TestPrivileges(t *testing.T) {
+	hermetic(t)
+	old := haveCapSysAdmin
+	t.Cleanup(func() { haveCapSysAdmin = old })
+	haveCapSysAdmin = func() (bool, error) { return false, nil }
 	root := t.TempDir()
 	writeFile(t, root, "etc/systemd/sysext.conf", "[SysExt]\nMutable=banana\n")
-	var out, errBuf bytes.Buffer
-	err := runWith([]string{"sysext", "--root", root, "status"}, &out, &errBuf)
-	if err == nil || !strings.Contains(err.Error(), "Mutable=") {
-		t.Errorf("expected invalid Mutable= config error, got %v", err)
+	for _, verb := range []string{"merge", "unmerge", "refresh"} {
+		stdout, stderr, rc := runCLI(t, "sysext", "--root="+root, verb)
+		if rc != 1 || stdout != "" || stderr != "Need to be privileged.\n" {
+			t.Errorf("%s: rc=%d stdout=%q stderr=%q", verb, rc, stdout, stderr)
+		}
 	}
-
-	// An explicit --mutable flag makes the bad config value irrelevant.
-	out.Reset()
-	if err := runWith([]string{"sysext", "--root", root, "--mutable=no", "status"}, &out, &errBuf); err != nil {
-		t.Errorf("explicit --mutable should override invalid config: %v", err)
+	if _, stderr, rc := runCLI(t, "sysext", "--root="+root, "status"); rc != 0 || strings.Contains(stderr, "privileged") {
+		t.Errorf("status needs no privileges: %q", stderr)
+	}
+	if _, err := old(); err != nil {
+		t.Errorf("capget: %v", err)
 	}
 }
 
-func TestWantsReload(t *testing.T) {
-	cases := []struct {
-		fields release.Fields
-		want   bool
-	}{
-		{release.Fields{"EXTENSION_RELOAD_MANAGER": "1"}, true},
-		{release.Fields{"EXTENSION_RELOAD_MANAGER": " 1 "}, true}, // trimmed
-		{release.Fields{"EXTENSION_RELOAD_MANAGER": "0"}, false},
-		{release.Fields{"EXTENSION_RELOAD_MANAGER": "yes"}, false}, // only "1" counts
-		{release.Fields{"EXTENSION_RELOAD_MANAGER": ""}, false},
-		{release.Fields{}, false},
-		{nil, false},
+func TestErrorText(t *testing.T) {
+	if got := errorText(failMsg("sysext: lower")); got != "sysext: lower" {
+		t.Errorf("failure = %q", got)
 	}
-	for _, tc := range cases {
-		if got := wantsReload(tc.fields); got != tc.want {
-			t.Errorf("wantsReload(%v) = %v, want %v", tc.fields, got, tc.want)
-		}
+	if got := errorText(&overlay.AlreadyMergedError{Hierarchy: "/usr"}); got != "Hierarchy '/usr' is already merged." {
+		t.Errorf("already merged = %q", got)
 	}
-}
-
-func TestShouldReloadManager(t *testing.T) {
-	cases := []struct {
-		requested, noReload, want bool
-	}{
-		{true, false, true},   // requested, allowed -> reload
-		{true, true, false},   // --no-reload suppresses
-		{false, false, false}, // nothing requested
-		{false, true, false},
-	}
-	for _, tc := range cases {
-		if got := shouldReloadManager(tc.requested, tc.noReload); got != tc.want {
-			t.Errorf("shouldReloadManager(%v, %v) = %v, want %v",
-				tc.requested, tc.noReload, got, tc.want)
-		}
+	if got := errorText(os.ErrNotExist); got != "No such file or directory" {
+		t.Errorf("plain error = %q", got)
 	}
 }

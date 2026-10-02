@@ -1,26 +1,55 @@
 #!/sbin/openrc-run
+# shellcheck shell=busybox disable=SC2034
+# Counterpart of systemd-confext.service. Configuration extensions are merged
+# in the boot runlevel, before the services reading /etc; the kernel command
+# line option systemd.confext=0 makes confext skip the merge when started
+# from here.
 
-description="Merge configuration extension images into /etc"
+description="Merge configuration extension images into /etc/"
+extra_started_commands="reload"
+description_reload="Refresh the merged configuration extensions"
 
 command="/usr/bin/confext"
+# OpenRC executes the scripts in /etc/init.d directly, so /etc must not be
+# mounted noexec (the systemd default for confexts).
+command_args="${CONFEXT_OPTS---noexec=false}"
 
 depend() {
 	need localmount
 	after modules
+	before bootmisc opentmpfiles-setup sysctl hostname networking
+}
+
+# The ConditionCapability=CAP_SYS_ADMIN of the systemd unit: in containers
+# without it there is nothing to do.
+privileged() {
+	local cap
+	cap=$(sed -n 's/^CapEff:[[:space:]]*//p' /proc/self/status)
+	[ $(( (0x${cap:-0} >> 21) & 1 )) -eq 1 ] && return 0
+	einfo "No CAP_SYS_ADMIN, skipping"
+	return 1
 }
 
 start() {
+	privileged || return 0
 	ebegin "Merging configuration extensions"
-	$command merge
+	$command $command_args refresh
+	eend $?
+}
+
+reload() {
+	privileged || return 0
+	ebegin "Refreshing configuration extensions"
+	$command $command_args refresh
 	eend $?
 }
 
 stop() {
+	privileged || return 0
+	# Nothing is to be restarted while the system goes down.
+	local noreload=
+	yesno "$RC_GOINGDOWN" && noreload=--no-reload
 	ebegin "Unmerging configuration extensions"
-	$command unmerge
+	$command $command_args $noreload unmerge
 	eend $?
-}
-
-status() {
-	$command status
 }

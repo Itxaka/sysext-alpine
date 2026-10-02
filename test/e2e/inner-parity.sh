@@ -1,55 +1,21 @@
 #!/bin/sh
-# e2e test suite for sysext-alpine systemd-parity features. Runs INSIDE a
-# privileged Alpine container (launched by run.sh). Builds one extension image
+# e2e suite for systemd-parity features. Builds one extension image
 # (squashfs, ext4 fallback) and exercises:
 #   1. /etc/systemd/sysext.conf + conf.d drop-ins (Mutable=) and flag priority
-#   2. SYSTEMD_SYSEXT_HIERARCHIES environment variable (valid and bogus)
-#   3. Concurrent-merge locking (no corruption, no wedging)
-#   4. SYSEXT_SCOPE enforcement in extension-release
-#   5. EXTENSION_RELOAD_MANAGER + OpenRC reload / --no-reload
-#   6. status --json=short output shape
-# Reports PASS/FAIL/SKIP per step; exits non-zero if any step FAILed.
-#
-# NOTE: the container shares the host kernel. run.sh bind-mounts the host's
-# /lib/modules read-only so missing filesystems can be modprobe'd.
-set -u
+#   2. SYSTEMD_SYSEXT_HIERARCHIES environment variable (valid; invalid is an
+#      error, like in systemd)
+#   3. Locking: concurrent merges, a held lock blocks merge but not status,
+#      parallel refreshes leave one overlay
+#   4. SYSEXT_SCOPE: extensions for another scope are ignored
+#   5. EXTENSION_RELOAD_MANAGER without a running OpenRC, --no-reload
+#   6. status output shape
+. /work/test/e2e/lib.sh
 
-FAILS=0
-SKIPS=0
-
-pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
-skip() { echo "SKIP: $*"; SKIPS=$((SKIPS + 1)); }
-
-# A filesystem is usable if it is registered with the kernel, or can be
-# loaded via modprobe (host /lib/modules is bind-mounted by run.sh).
-fs_supported() {
-    grep -qw "$1" /proc/filesystems && return 0
-    modprobe "$1" 2>/dev/null || true
-    grep -qw "$1" /proc/filesystems
-}
-
-# ---------------------------------------------------------------------------
-# Environment setup
-# ---------------------------------------------------------------------------
 echo "=== Installing build dependencies ==="
-apk add --no-cache squashfs-tools e2fsprogs util-linux kmod openrc \
-    || { echo "FATAL: apk add failed"; exit 1; }
-
-if [ ! -x /work/bin/sysext ]; then
-    echo "FATAL: /work/bin/sysext missing (run 'make build-static' on the host)"
-    exit 1
-fi
-install -m 0755 /work/bin/sysext /usr/bin/sysext
-
-if ! fs_supported overlay; then
-    echo "FATAL: kernel does not support overlayfs; cannot test anything"
-    exit 1
-fi
-
+pkg_add squashfs-tools e2fsprogs kmod openrc jq
+install_sysext
+need_overlayfs
 mkdir -p /var/lib/extensions
-WORKDIR=/tmp/e2e-parity-build
-mkdir -p "$WORKDIR"
 
 ROUTING=/var/lib/extensions.mutable
 MARKER=/usr/.systemd-sysext
@@ -61,8 +27,8 @@ CONFD=/etc/systemd/sysext.conf.d
 # Emulate a real host by mounting a tmpfs over the routing base so any
 # mutable-mode behaviour is testable.
 mkdir -p "$ROUTING"
-mount -t tmpfs -o mode=0755 tmpfs "$ROUTING" \
-    || { echo "FATAL: cannot mount tmpfs over $ROUTING"; exit 1; }
+mount -t tmpfs -o mode=0755 tmpfs "$ROUTING" || fatal "cannot mount tmpfs over $ROUTING"
+track_mount "$ROUTING"
 
 # clean_configs — remove every sysext.conf / drop-in left behind by a test.
 clean_configs() {
@@ -70,64 +36,37 @@ clean_configs() {
     rm -rf "$CONFD"
 }
 
-# ---------------------------------------------------------------------------
-# Test image construction helpers
-# ---------------------------------------------------------------------------
-
 # Pick an image filesystem once: squashfs preferred, ext4 fallback.
-FSTYPE=""
 if fs_supported squashfs; then
     FSTYPE=squashfs
 elif fs_supported ext4; then
     FSTYPE=ext4
+    skip fs:squashfs "squashfs not supported, using ext4 images"
 else
-    skip "neither squashfs nor ext4 supported; skipping all parity tests"
-    echo "==========================================="
-    echo "Failures: $FAILS  Skips: $SKIPS"
-    echo "RESULT: PASS"
-    exit 0
+    skip fs:squashfs "neither squashfs nor ext4 supported; skipping all parity tests"
+    finish
 fi
 echo "=== Using image filesystem: $FSTYPE ==="
 
-# make_tree NAME DIR RELEASE — populate DIR with a sysext payload for
-# extension NAME using RELEASE as the extension-release contents.
+# make_tree NAME DIR RELEASE — sysext payload for NAME with RELEASE as its
+# extension-release contents.
 make_tree() {
-    name=$1
-    dir=$2
-    release=$3
-    rm -rf "$dir"
-    mkdir -p "$dir/usr/lib/extension-release.d" "$dir/usr/share/$name"
-    printf '%s' "$release" \
-        > "$dir/usr/lib/extension-release.d/extension-release.$name"
-    echo "hello from $name" > "$dir/usr/share/$name/hello.txt"
+    mk_tree "$2" "$1" "$3"
 }
 
-# build_image NAME DIR — build /var/lib/extensions/NAME.raw from DIR using
-# the selected filesystem. Returns non-zero on build failure.
+# build_image NAME DIR — build /var/lib/extensions/NAME.raw from DIR.
 build_image() {
-    name=$1
-    dir=$2
-    img=/var/lib/extensions/$name.raw
-    rm -f "$img"
     if [ "$FSTYPE" = squashfs ]; then
-        mksquashfs "$dir" "$img" -noappend -quiet
+        img_squashfs "$2" "/var/lib/extensions/$1.raw"
     else
-        dd if=/dev/zero of="$img" bs=1M count=8 status=none
-        mkfs.ext4 -q -F -d "$dir" "$img" 2>/dev/null
+        img_ext4 "$2" "/var/lib/extensions/$1.raw" 8
     fi
 }
 
 echo "=== Building test image ==="
 EXT=test-parity
-make_tree "$EXT" "$WORKDIR/$EXT" 'ID=_any
-ARCHITECTURE=_any
-'
-if build_image "$EXT" "$WORKDIR/$EXT"; then
-    echo "built: $EXT.raw ($FSTYPE)"
-else
-    echo "FATAL: could not build $EXT.raw"
-    exit 1
-fi
+make_tree "$EXT" "$WORKDIR/$EXT" 'ID=_any\nARCHITECTURE=_any\n'
+build_image "$EXT" "$WORKDIR/$EXT" || fatal "could not build $EXT.raw"
 
 # merged_payload — sanity check that the test-parity extension is merged.
 merged_payload() { [ -f "/usr/share/$EXT/hello.txt" ]; }
@@ -224,15 +163,20 @@ else
     fail "unmerge with SYSTEMD_SYSEXT_HIERARCHIES=/usr"
 fi
 
-# 2b. Bogus (relative) value: defaults are used, merge still works.
-if SYSTEMD_SYSEXT_HIERARCHIES=relative/path sysext merge; then
-    pass "merge with bogus SYSTEMD_SYSEXT_HIERARCHIES falls back to defaults"
+# 2b. Invalid (relative) value: an error, nothing is merged.
+out=$(SYSTEMD_SYSEXT_HIERARCHIES=relative/path sysext merge 2>&1)
+rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "Failed to determine sysext hierarchies"; then
+    pass "merge with an invalid SYSTEMD_SYSEXT_HIERARCHIES fails"
 else
-    fail "merge with bogus SYSTEMD_SYSEXT_HIERARCHIES must still work"
+    fail "merge with an invalid SYSTEMD_SYSEXT_HIERARCHIES: rc=$rc $out"
+    sysext unmerge >/dev/null 2>&1
 fi
-merged_payload && pass "payload merged with bogus hierarchies env" \
-    || fail "payload missing with bogus hierarchies env"
-sysext unmerge || fail "unmerge after bogus hierarchies env"
+if mountpoint -q /usr 2>/dev/null; then
+    fail "/usr merged despite an invalid hierarchy list"
+else
+    pass "nothing merged with an invalid hierarchy list"
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Locking: two concurrent merges must not corrupt state or wedge.
@@ -273,15 +217,44 @@ else
 fi
 sysext unmerge || fail "unmerge after concurrency test"
 
+# A held lock blocks merge, but neither status nor the other class.
+mkdir -p /run/systemd
+(flock -x 9; sleep 3) 9>/run/systemd/sysext.lock &
+lockpid=$!
+sleep 0.5
+timeout 1 sysext merge >/dev/null 2>&1
+rc=$?
+if [ "$rc" = 124 ] || [ "$rc" = 143 ]; then
+    pass "merge waits while the lock is held"
+else
+    fail "merge did not wait for the lock (rc=$rc)"
+fi
+timeout 1 sysext status >/dev/null 2>&1 && pass "status does not take the lock" \
+    || fail "status blocked by the lock"
+timeout 1 sysext --confext status >/dev/null 2>&1 && pass "confext not blocked by the sysext lock" \
+    || fail "confext blocked by the sysext lock"
+wait "$lockpid"
+sysext merge >/dev/null 2>&1 && pass "merge after the lock is released" || fail "merge after the lock is released"
+for _ in 1 2 3 4; do
+    sysext refresh --always-refresh=yes >/dev/null 2>&1 &
+done
+wait
+count=$(awk '$5 == "/usr" && / - overlay /' /proc/self/mountinfo | wc -l)
+if [ "$count" = 1 ]; then
+    pass "parallel refreshes leave exactly one overlay on /usr"
+else
+    fail "parallel refreshes left $count overlays on /usr"
+fi
+merged_payload && pass "payload merged after parallel refreshes" || fail "payload missing after parallel refreshes"
+sysext unmerge || fail "unmerge after parallel refreshes"
+
 # ---------------------------------------------------------------------------
 # 4. SYSEXT_SCOPE enforcement
 # ---------------------------------------------------------------------------
 echo "--- 4. SYSEXT_SCOPE enforcement ---"
 
 SCOPE_EXT=test-scope
-make_tree "$SCOPE_EXT" "$WORKDIR/$SCOPE_EXT" 'ID=_any
-SYSEXT_SCOPE=initrd
-'
+make_tree "$SCOPE_EXT" "$WORKDIR/$SCOPE_EXT" 'ID=_any\nSYSEXT_SCOPE=initrd\n'
 if build_image "$SCOPE_EXT" "$WORKDIR/$SCOPE_EXT"; then
     pass "built $SCOPE_EXT.raw (SYSEXT_SCOPE=initrd)"
 else
@@ -289,22 +262,31 @@ else
 fi
 out=$(sysext merge 2>&1)
 rc=$?
-if [ "$rc" -ne 0 ]; then
-    pass "merge fails with initrd-only scope extension"
-    if echo "$out" | grep -qi scope; then
-        pass "merge failure mentions scope"
-    else
-        fail "merge failure does not mention scope (output: $out)"
-    fi
+if [ "$rc" -eq 0 ]; then
+    pass "merge ignores the initrd-only scope extension"
 else
-    fail "merge succeeded but $SCOPE_EXT scope excludes system"
+    fail "merge with an initrd-only scope extension failed (output: $out)"
 fi
+if [ -f "/usr/share/$SCOPE_EXT/hello.txt" ]; then
+    fail "$SCOPE_EXT merged although its scope excludes system"
+else
+    pass "initrd-only scope extension not merged"
+fi
+merged_payload && pass "compatible extension merged next to it" || fail "compatible extension missing"
 sysext unmerge >/dev/null 2>&1 || true
+mv "/var/lib/extensions/$EXT.raw" "$WORKDIR/$EXT.raw"
+out=$(sysext merge 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "No suitable extensions found (1 ignored due to incompatible image(s))." ]; then
+    pass "only an initrd-only scope extension: nothing merged"
+else
+    fail "only an initrd-only scope extension: rc=$rc $out"
+    sysext unmerge >/dev/null 2>&1
+fi
+mv "$WORKDIR/$EXT.raw" "/var/lib/extensions/$EXT.raw"
 
 # Same extension, scope includes "system": merge must succeed.
-make_tree "$SCOPE_EXT" "$WORKDIR/$SCOPE_EXT" 'ID=_any
-SYSEXT_SCOPE=system initrd
-'
+make_tree "$SCOPE_EXT" "$WORKDIR/$SCOPE_EXT" 'ID=_any\nSYSEXT_SCOPE=system initrd\n'
 if build_image "$SCOPE_EXT" "$WORKDIR/$SCOPE_EXT"; then
     pass "rebuilt $SCOPE_EXT.raw (SYSEXT_SCOPE=system initrd)"
 else
@@ -324,122 +306,103 @@ sysext unmerge || fail "unmerge after scope test"
 rm -f "/var/lib/extensions/$SCOPE_EXT.raw"
 
 # ---------------------------------------------------------------------------
-# 5. EXTENSION_RELOAD_MANAGER + OpenRC
+# 5. EXTENSION_RELOAD_MANAGER without a running OpenRC (inner-openrc.sh
+#    covers the service manager itself)
 # ---------------------------------------------------------------------------
-echo "--- 5. EXTENSION_RELOAD_MANAGER / OpenRC ---"
+echo "--- 5. EXTENSION_RELOAD_MANAGER without OpenRC ---"
 
 RELOAD_EXT=test-reload
-make_tree "$RELOAD_EXT" "$WORKDIR/$RELOAD_EXT" 'ID=_any
-EXTENSION_RELOAD_MANAGER=1
-'
+make_tree "$RELOAD_EXT" "$WORKDIR/$RELOAD_EXT" 'ID=_any\nEXTENSION_RELOAD_MANAGER=yes\nEXTENSION_RESTART_UNITS=foo.service\n'
 if build_image "$RELOAD_EXT" "$WORKDIR/$RELOAD_EXT"; then
-    pass "built $RELOAD_EXT.raw (EXTENSION_RELOAD_MANAGER=1)"
+    pass "built $RELOAD_EXT.raw (EXTENSION_RELOAD_MANAGER=yes)"
 else
     fail "build $RELOAD_EXT.raw"
 fi
-mkdir -p /run/openrc   # openrc container image won't have it
+mkdir -p /run/openrc   # OpenRC installed, but it did not boot this container
 out=$(sysext merge 2>&1)
 rc=$?
-if [ "$rc" -eq 0 ]; then
-    pass "merge succeeds with EXTENSION_RELOAD_MANAGER=1"
+if [ "$rc" -eq 0 ] && [ "$out" = "Using extensions '$EXT.raw', '$RELOAD_EXT.raw'.
+Merged extensions into '/usr'." ]; then
+    pass "merge with EXTENSION_RELOAD_MANAGER=yes skips the absent service manager silently"
 else
-    fail "merge fails with EXTENSION_RELOAD_MANAGER=1 (output: $out)"
+    fail "merge with EXTENSION_RELOAD_MANAGER=yes: rc=$rc $out"
 fi
 if [ -f "/usr/share/$RELOAD_EXT/hello.txt" ]; then
     pass "reload extension payload merged"
 else
     fail "reload extension payload missing"
 fi
-# Soft: rc-update -u running is hard to observe directly; the unit tests
-# cover the decision logic. Here only assert merge produced no error above.
-if command -v rc-update >/dev/null 2>&1 && [ -d /run/openrc ]; then
-    pass "rc-update and /run/openrc present (reload path exercisable)"
+out=$(SYSTEMD_LOG_LEVEL=debug sysext unmerge 2>&1)
+if echo "$out" | grep -qx "OpenRC is not running, not reloading the service manager."; then
+    pass "unmerge notes the absent service manager at debug level"
 else
-    skip "rc-update or /run/openrc missing; reload path not exercisable"
+    fail "unmerge debug output: $out"
 fi
-sysext unmerge || fail "unmerge after reload-manager merge"
-
-# Soft: with --no-reload, a debug note mentioning no-reload should show up
-# on stderr. Tolerate absence (message wording/level may vary).
 out=$(sysext merge --no-reload 2>&1)
 rc=$?
-if [ "$rc" -eq 0 ]; then
-    pass "merge --no-reload succeeds"
+if [ "$rc" -eq 0 ] && ! echo "$out" | grep -q -e Debug -e OpenRC -e no-reload; then
+    pass "merge --no-reload succeeds quietly"
 else
-    fail "merge --no-reload fails (output: $out)"
-fi
-if echo "$out" | grep -qi 'no-reload'; then
-    pass "merge --no-reload mentions no-reload on stderr"
-else
-    skip "no-reload debug note not observed (soft assertion)"
+    fail "merge --no-reload: rc=$rc $out"
 fi
 sysext unmerge || fail "unmerge after --no-reload merge"
 rm -f "/var/lib/extensions/$RELOAD_EXT.raw"
 
 # ---------------------------------------------------------------------------
-# 6. status --json=short output shape
+# 6. status output shape (systemd 262: extensions is always an array)
 # ---------------------------------------------------------------------------
 echo "--- 6. status --json=short shape ---"
 
-if sysext merge; then
+if sysext merge 2>/dev/null; then
     pass "merge before json status check"
 else
     fail "merge before json status check"
 fi
-out=$(sysext status --json=short 2>&1)
+out=$(sysext status --json=short)
 rc=$?
-if [ "$rc" -eq 0 ]; then
-    pass "status --json=short exits 0 (merged)"
+if [ "$rc" -eq 0 ] && echo "$out" | jq -e '.[] | select(.hierarchy == "/usr") | (.extensions == ["'"$EXT"'"]) and (.since | type == "number")' >/dev/null; then
+    pass "merged json: extensions array, since in usec"
 else
-    fail "status --json=short exited $rc (merged)"
+    fail "merged json (rc=$rc): $out"
 fi
-if echo "$out" | grep -Fq '"hierarchy":"/usr"'; then
-    pass "merged json contains \"hierarchy\":\"/usr\""
+expect_keys=$(echo "$out" | jq -c '[.[] | keys] | unique')
+if [ "$expect_keys" = '[["extensions","hierarchy","since"]]' ]; then
+    pass "json objects carry exactly hierarchy, extensions, since"
 else
-    fail "merged json missing \"hierarchy\":\"/usr\" (output: $out)"
+    fail "json keys: $expect_keys"
 fi
-if echo "$out" | grep -Fq '"extensions":['; then
-    pass "merged json has extensions array"
+if [ "$(sysext status --no-legend | awk '$1 == "/usr" {print $2}')" = "$EXT" ]; then
+    pass "table lists the merged extension"
 else
-    fail "merged json missing \"extensions\":[ (output: $out)"
+    fail "table: $(sysext status)"
 fi
-if echo "$out" | grep -Fq '"merged"'; then
-    fail "merged json contains \"merged\" key but must not (output: $out)"
-else
-    pass "merged json does not contain \"merged\" key"
-fi
-sysext unmerge || fail "unmerge before unmerged json check"
+sysext unmerge 2>/dev/null || fail "unmerge before unmerged json check"
 
-out=$(sysext status --json=short 2>&1)
-rc=$?
-if [ "$rc" -eq 0 ]; then
-    pass "status --json=short exits 0 (unmerged)"
+out=$(sysext status --json=short)
+if [ "$out" = '[{"hierarchy":"/opt","extensions":[],"since":null},{"hierarchy":"/usr","extensions":[],"since":null}]' ]; then
+    pass "unmerged json matches systemd 262"
 else
-    fail "status --json=short exited $rc (unmerged)"
+    fail "unmerged json: $out"
 fi
-if echo "$out" | grep -Fq '"extensions":"none"'; then
-    pass "unmerged json contains \"extensions\":\"none\""
+out=$(sysext status)
+if [ "$out" = "HIERARCHY EXTENSIONS SINCE
+/opt      -          -
+/usr      -          -" ]; then
+    pass "unmerged table shows '-'"
 else
-    fail "unmerged json missing \"extensions\":\"none\" (output: $out)"
+    fail "unmerged table: $out"
 fi
-if echo "$out" | grep -Fq '"since":null'; then
-    pass "unmerged json contains \"since\":null"
+if rmdir /opt 2>/dev/null; then
+    out=$(sysext status --json=short | jq -r '.[].hierarchy')
+    mkdir /opt
+    if [ "$out" = /usr ]; then
+        pass "a missing hierarchy is left out of status"
+    else
+        fail "status with /opt missing: $out"
+    fi
 else
-    fail "unmerged json missing \"since\":null (output: $out)"
+    skip opt-removable "/opt not removable"
 fi
 
-# Final cleanup so the container exits with nothing mounted or configured.
-sysext unmerge >/dev/null 2>&1 || true
 clean_configs
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-echo "==========================================="
-echo "Failures: $FAILS  Skips: $SKIPS"
-if [ "$FAILS" -gt 0 ]; then
-    echo "RESULT: FAIL"
-    exit 1
-fi
-echo "RESULT: PASS"
-exit 0
+finish

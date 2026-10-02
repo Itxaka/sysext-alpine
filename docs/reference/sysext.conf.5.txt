@@ -106,4 +106,4 @@ NOTES
          be  available  during  early boot, and must not be used for configura‐
          tion.
 
-systemd 260.2                                                    SYSEXT.CONF(5)
+systemd 262                                                      SYSEXT.CONF(5)

@@ -3,8 +3,10 @@
 Reimplementation of `systemd-sysext`/`systemd-confext` behavior as a standalone
 static Go binary for Alpine Linux (musl, OpenRC, no systemd).
 
-Sources: systemd 260 man page (`docs/reference/systemd-sysext.8.txt`),
-systemd `src/sysext/sysext.c` (v260), UAPI Discoverable Partitions Specification.
+Sources: systemd 262 (`src/sysext/sysext.c`, `src/shared/extension-util.c`,
+`src/basic/os-util.c`, `src/shared/discover-image.c`, `src/shared/vpick.c`,
+`src/basic/env-file.c`, `src/shared/conf-parser.c`), the man pages in
+`docs/reference/`, UAPI Discoverable Partitions Specification.
 
 Compatibility goal: **same paths, same on-disk/runtime layout, same overlay
 semantics** as systemd-sysext, so images and tooling interoperate.
@@ -15,173 +17,265 @@ semantics** as systemd-sysext, so images and tooling interoperate.
 |---|---|---|
 | Merges into | `/usr` and `/opt` | `/etc` |
 | Release file in image | `/usr/lib/extension-release.d/extension-release.NAME` | `/etc/extension-release.d/extension-release.NAME` |
-| Level field | `SYSEXT_LEVEL=` | `CONFEXT_LEVEL=` |
-| Search dirs (priority order) | `/etc/extensions`, `/run/extensions`, `/var/lib/extensions` | `/run/confexts`, `/var/lib/confexts`, `/usr/lib/confexts`, `/usr/local/lib/confexts` |
+| Level / scope fields | `SYSEXT_LEVEL=`, `SYSEXT_SCOPE=` | `CONFEXT_LEVEL=`, `CONFEXT_SCOPE=` |
+| Search dirs (priority order) | `/etc/extensions`, `/run/extensions`, `/var/lib/extensions` | `/run/confexts`, `/var/lib/confexts`, `/usr/local/lib/confexts`, `/usr/lib/confexts` |
+| Class suffix | `.sysext` | `.confext` |
 | Mount flags on overlay | `ro,nodev` | `ro,nodev,nosuid,noexec` (`--noexec=false` drops noexec) |
+
+The confext order follows systemd's `image_search_path` (the man page lists
+`/usr/lib/confexts` before `/usr/local/lib/confexts`; the code wins).
 
 - Extensions are purely additive by design (overlayfs allows override; permitted but discouraged).
 - Files outside the target hierarchies in an image are ignored.
-- An empty **directory** named like an extension (without `.raw`) in a
-  higher-priority search dir **masks** a same-named extension in lower-priority dirs.
-- In each search dir: subdirectories = directory-based images; `*.raw` files = disk images.
-  Symlinks followed.
 
-## 2. extension-release matching
+### Discovery (`image_discover()`)
 
-`NAME` in `extension-release.NAME` must match the image name (image filename
-minus `.raw`, or directory name). Escape hatch: a file with xattr
-`user.extension-release.strict` set to false-y is accepted regardless of name
-(systemd picks the single file in the dir then).
+- Search dirs and their entries are resolved inside `--root` (absolute
+  symlink targets restart at the root, `..` never leaves it). Dangling
+  entries and `.sysupdate.*` temporaries are skipped; nothing else is hidden,
+  so `.foo.raw` is the image `.foo`.
+- Regular files need the `.raw` suffix (`foo.raw` → `foo`), directories are
+  directory images, block devices are `block` images named after the entry.
+  The class suffix is optional and stripped: `foo.sysext.raw` and the
+  directory `foo.sysext` are both `foo` for sysext (but `foo.confext.raw`
+  stays `foo.confext`). Names must be valid image names: a file name without
+  control characters, valid UTF-8, not starting with `.#`.
+- Versioned directories (vpick): `NAME[.sysext][.raw].v/` contains
+  `NAME_VERSION[_ARCH][+LEFT[-DONE]]SUFFIX` entries (regular files or block
+  devices for `.raw`, directories otherwise). Entries for a foreign
+  architecture are skipped (native, secondary — e.g. x86 on x86-64 — or no
+  architecture qualify). The pick prefers entries with boot tries left, then
+  the newest version (`strverscmp_improved`), then native over secondary
+  architecture, then more tries left, fewer tries done, and finally the file
+  name. The image is called `NAME`; a `.v` dir without a usable entry is
+  skipped and shadows nothing.
+- The first image of a name (search dir priority, then name) shadows all
+  later ones. An empty directory named like an extension in a higher-priority
+  dir therefore **masks** it: it is listed and, carrying no release data,
+  ignored at merge time.
+- `.mstack` directories are not supported and skipped (systemd lists them
+  and refuses to merge them).
+- `list` time: mtime (µs) for raw images, birth time (statx btime or the
+  `user.crtime_usec` xattr, whichever is older) for directories.
 
-File format = os-release(5) format (KEY=VALUE, shell-style quoting, `#` comments).
+## 2. extension-release lookup and matching
 
-Match algorithm against host `/etc/os-release` (fallback `/usr/lib/os-release`):
+### Lookup (`open_extension_release()`)
 
-1. `ID=` of extension must equal host `ID`, **unless** extension `ID=_any`.
-2. If extension `ID != _any`:
-   - If extension defines `SYSEXT_LEVEL=` (confext: `CONFEXT_LEVEL=`): it must
-     equal host's same field.
-   - Else: extension `VERSION_ID=` must equal host `VERSION_ID=`.
-3. If extension defines `ARCHITECTURE=` and value is not `_any`, it must match
-   the kernel architecture (uname-based, systemd `ConditionArchitecture=`
-   identifiers: `x86-64`, `arm64`, `riscv64`, `x86`, `arm`, ...).
-4. `--force` skips all checks.
-5. `EXTENSION_RELOAD_MANAGER=1` → systemd reloads the service manager; on
-   Alpine: `rc-update -u` refreshes the OpenRC dependency cache after merge
-   (skipped with `--no-reload`, with `--force`, on unmerge, or when not an
-   OpenRC system).
+Inside the image tree (symlinks resolved inside the image):
 
-Extra fields `SYSEXT_SCOPE=`/`CONFEXT_SCOPE=` (whitespace-separated list of
-`initrd`, `system`, `portable`): enforced. We always run on a booted system,
-so if the class's scope field is present and non-empty its list must contain
-`system`, otherwise the image is rejected with a descriptive error. Absent or
-empty field: no restriction (applies everywhere).
+1. `extension-release.NAME` in the class's release dir, if it exists.
+2. Otherwise every regular, non-symlink `extension-release.X` (valid image
+   name, hidden and backup files skipped) is a candidate when `X` equals the
+   image's base name — `NAME` without `.sysext.raw`/`.confext.raw`/`.raw`,
+   cut at the first `_` or `+` (so `foo_1.2.raw` uses
+   `extension-release.foo`) — or when its `user.extension-release.strict`
+   xattr parses as boolean false (`parse_boolean`: `0`, `no`, `n`, `false`,
+   `f`, `off`, any case). More than one candidate is an error (ENOTUNIQ).
+
+A missing, ambiguous or unparsable release file means the image carries no
+release data. File format: os-release(5), parsed like systemd's env-file
+parser (whitespace around `=` ignored, `#`/`;` comments, quotes may span
+lines and concatenate, backslash escapes and continuations; invalid UTF-8
+fails the file).
+
+A sysext directory image must not contain `/usr/lib/os-release` (it would
+replace the host's OS identity); such an image fails the merge. For disk
+images the check is part of mounting: an image whose tree is neither an
+extension of either class (without that file) nor, when reading metadata,
+an OS tree is refused.
+
+### Host data
+
+Host os-release: `$SYSTEMD_OS_RELEASE` if set (no fallback), else
+`/etc/os-release`, then `/usr/lib/os-release`, resolved inside `--root`. An
+empty host `ID=` fails the merge. Host scope: `initrd` when
+`/etc/initrd-release` exists in the root, `system` otherwise. Architecture:
+`uname(2)` (honors `setarch`), mapped to systemd identifiers (`x86-64`,
+`arm64`, `x86`, `arm`, `riscv64`, ...); GPT partition selection uses the
+native build architecture instead.
+
+### Matching (`extension_release_validate()`)
+
+An image is *ignored* (not merged, no error) unless all of these hold, in
+order:
+
+1. It carries release data.
+2. Scope: `SYSEXT_SCOPE=`/`CONFEXT_SCOPE=` (whitespace-separated) contains
+   the host scope; absent means `system portable`, present-but-empty matches
+   nothing.
+3. `ARCHITECTURE=` is empty, `_any` or the host architecture.
+4. `ID=` is non-empty; `_any` matches immediately.
+5. `ID=` equals the host `ID` or one of the host `ID_LIKE` words.
+6. If the host has neither `VERSION_ID` nor the class level: match (rolling
+   release).
+7. If host and extension both set the class level, they must be equal;
+   otherwise, if the host has `VERSION_ID`, the extension's `VERSION_ID` must
+   be equal. Empty values count as unset.
+
+`--force` skips matching but not the metadata checks. Alpine's `VERSION_ID`
+includes the patch level (`3.24.2`), so `VERSION_ID`-pinned extensions stop
+matching on every point release; `ID=_any` or a `SYSEXT_LEVEL` agreed with
+the host avoids that.
+
+Release fields consumed by the service manager step (§6):
+`EXTENSION_RELOAD_MANAGER=` (boolean), `EXTENSION_RESTART_UNITS=` and
+`EXTENSION_RELOAD_OR_RESTART_UNITS=` (whitespace-separated unit names).
 
 ## 3. Image formats
 
-1. **Plain directory** (or btrfs subvolume) — used directly as lowerdir source.
-2. **Raw disk image without partition table** — bare filesystem (squashfs,
-   erofs, ext4). Detect by superblock magic. Loop-mount read-only.
-3. **Raw GPT disk image** (DDI) — partition discovery per UAPI Discoverable
-   Partitions Spec. Loop device with partition scan. Relevant type GUIDs:
-   - root x86-64: `4f68bce3-e8cd-4db1-96e7-fbcaf984b709`
-   - root arm64:  `b921b045-1df0-41c3-af44-4c6f280d3fae`
-   - usr  x86-64: `8484680c-9521-48c6-9c11-b0720656f69e`
-   - usr  arm64:  `b0e01050-ee5f-4390-949a-9101b17104e9`
-   Use root partition if present, else usr partition (mounted at `/usr` of the
-   image tree). Verity and verity-signature partitions are honored: see
-   docs/VERITY.md (dm-verity activation, PKCS#7 signature verification
-   against /etc/verity.d, systemd.image-policy(7) enforcement).
+1. **Directory** (or btrfs subvolume): bind-mounted into the workspace.
+2. **Raw image** (`*.raw`, or a block device): a bare filesystem, an MBR
+   image or a GPT disk image (DDI) per the UAPI Discoverable Partitions
+   Specification, dissected like systemd's `dissect_image()`: partitions
+   picked per architecture (native, then secondary), root and/or usr,
+   dm-verity with the root hash from a sidecar, the signature partition or
+   the partition UUIDs, PKCS#7 signature verification and
+   systemd.image-policy(7) enforcement. Details: docs/VERITY.md.
 
-Filesystem magics: squashfs `hsqs` @ 0; erofs `0xE0F5E1E2` @ 1024; ext4
-`0xEF53` @ 1080; GPT: `EFI PART` @ LBA1 (offset 512, also check 4096 sector).
+A disk image whose tree is not an extension (no matching extension-release)
+is ignored; one carrying `/usr/lib/os-release` instead is refused.
 
-## 4. Runtime workspace & overlay construction (compat with systemd)
+## 4. Runtime workspace & overlay construction
 
-Workspace: `/run/systemd/sysext/` (confext: `/run/systemd/confext/`), mode 0700:
+### Workspace
+
+`/run/systemd/sysext/` (confext: `/run/systemd/confext/`): a private tmpfs
+(source `sysext`/`confext`, mode 0700) mounted while something is merged.
+Merges into a `--root` keep their workspace on the host as well, at
+`/run/systemd/<class>.<first 16 hex digits of sha256(resolved root)>`, never
+inside the root. Operations are serialized with `flock` on
+`<workspace>.lock` (systemd itself does not lock).
 
 ```
-/run/systemd/sysext/
-├── extensions/<name>/     # per-image mount point (or symlink target for dirs)
-├── meta/<hierarchy>/      # synthesized metadata staging (topmost lowerdir)
-├── overlay/<hierarchy>/   # where the overlayfs is assembled before move
+<workspace>/
+├── extensions/<name>/      image trees: raw images mounted, directories
+│                           bind-mounted (systemd's layout)
+├── meta/<hierarchy>/       top layer holding the metadata directory
+├── overlay/<hierarchy>/    staging mount point of the overlay
+├── mh_workspace/<hierarchy>/  ephemeral upper/work dirs (ephemeral modes)
+└── next.*/                 refresh of a live merge builds here first
 ```
 
-Note: systemd dissects each image once and mounts the *image root* at
-`extensions/<name>`; hierarchy paths used in lowerdirs are
-`extensions/<name>/usr`, `extensions/<name>/opt`, `extensions/<name>/etc`.
+Hierarchy paths are nested, not escaped (`meta/usr`, `meta/foo/bar`). Each
+refresh builds in a new `next.*` directory; one left behind because moving
+it into place failed may still back the merged overlays and stays until the
+workspace goes away on unmerge.
+Teardown only unmounts (via `/proc/self/mountinfo`, deepest first) and never
+deletes through symlinks.
 
-### Lowerdir ordering (per hierarchy, e.g. `/usr`)
+### Layers (per hierarchy, e.g. `/usr`)
 
 Overlayfs semantics: **first lowerdir = topmost = wins conflicts.**
 
 ```
-lowerdir = meta/<hierarchy>            (synthesized .systemd-sysext marker dir)
-         : ext[N-1]/<hierarchy>        (extensions reverse version-sorted —
-         : ...                          newest strverscmp first/topmost)
-         : ext[0]/<hierarchy>
-         : /<hierarchy>                (host, bottom)
+lowerdir = meta/<hierarchy>               (metadata directory)
+         : imported mutable dir           (import modes only)
+         : extensions/<newest>/<hierarchy> (strverscmp_improved, newest first)
+         : ...
+         : extensions/<oldest>/<hierarchy>
+         : <hierarchy>                     (host, unless it is the upperdir)
 ```
 
-Extensions sorted with `strverscmp_improved`; the paths array is built in
-reverse so the latest version is the top layer. Skip an extension's hierarchy
-dir if the image doesn't contain it. If host hierarchy doesn't exist or is
-empty, omit it (and `/opt` often doesn't exist — overlay then made of
-extensions only; if only one lowerdir would remain plus meta, still mount
-overlay for marker consistency).
+Extensions without content for a hierarchy are left out; a hierarchy no
+extension contributes to is not merged (unless a mutable mode is active).
+Hierarchies resolve inside `--root` (`chase`); missing ones are created as
+mount points when an extension contributes to them. The merged root keeps
+the mode of the host hierarchy. Mounts below the hierarchy are cloned into
+the merged tree and restored on unmerge, like systemd's `move_submounts()`.
+Staging works when `/` and `/run` have shared propagation.
 
-### Marker metadata (inside `meta/<hierarchy>/`)
+### Metadata directory
 
-Directory `.systemd-sysext/` (confext: `.systemd-confext/`) containing:
-- `extensions` — newline-delimited extension names (merge order)
-- `dev` — device major:minor (decimal `dev_t` as string) of the overlay mount,
-  written **after** mounting by stat'ing the mount point; used for
-  already-merged detection
-- `origin` — JSON: mapping/array describing source image paths
-- `work_dir` — only in mutable mode (out of MVP scope)
+`.systemd-sysext/` (confext: `.systemd-confext/`) at the top of every merged
+hierarchy, byte-compatible with systemd 262:
 
-`dev` write timing: systemd creates marker dir + `extensions`/`origin` before
-mount, mounts overlay at staging, stats it, writes `dev`, then moves the mount
-onto the real hierarchy (`MS_MOVE`).
+| file | content |
+|---|---|
+| `extensions` (confext: `confexts`) | all merged extension names, one per line, in merge order |
+| `dev` | `MAJOR:MINOR` of the overlay mount (decimal `dev_t` written by older versions is still read) |
+| `backing` | `MAJOR:MINOR` of the block device holding the host hierarchy, when there is one |
+| `origin` | sd_json pretty JSON: `mutable.mode`, `mutable.mutableDirs`, `mountOptions`, and per extension its path plus `verityHash`, or file handle / inode, mount id, crtime and mtime |
+| `work_dir` | C-escaped workdir path relative to the root (persistent mutable modes) |
 
-### Merged-state detection (`is_our_mount_point` equivalent)
+`refresh` skips when the new origin equals the recorded one (unless
+`--always-refresh=yes`). In mutable modes the metadata directory is mounted
+read-only so it cannot be copied up.
 
-A hierarchy is "merged by us" iff:
-1. it is a mount point, and
-2. `<hierarchy>/.systemd-sysext/dev` exists, and
-3. the `dev` value equals `stat(<hierarchy>).st_dev`.
+A hierarchy is merged by us iff it is a mount point whose `dev` marker
+equals its `st_dev`; symlinked hierarchies are resolved first.
 
-### Mount flags
+### Mount flags and options
 
-- sysext overlay: `MS_RDONLY|MS_NODEV` → opts `ro,nodev`
-- confext overlay: `MS_RDONLY|MS_NODEV|MS_NOSUID|MS_NOEXEC`
-- Image loop mounts: read-only.
-- Overlay fs options for immutable mode: just `lowerdir=...` (no upperdir/workdir).
-  Mutable modes add upperdir/workdir + `redirect_dir=on,metacopy=off,index=off`
-  data options and the MS_NOATIME flag: see docs/MUTABLE.md.
+- sysext: `ro,nodev`; confext: `ro,nodev,nosuid,noexec`. `--noexec=` sets
+  or clears `noexec` for both classes.
+- Overlay source `sysext`/`confext`, options `lowerdir=...`; mutable modes
+  add `upperdir=,workdir=` and `redirect_dir=on,noatime,metacopy=off,index=off`
+  (`noatime` becomes `MS_NOATIME`). `SYSTEMD_*_OVERLAYFS_MOUNT_OPTIONS` is
+  appended and replaces the mutable defaults, also when set to the empty
+  string; generic mount flags in it are turned into `MS_*` flags. See
+  docs/MUTABLE.md.
+- Image mounts: read-only, `nodev`, journal replay disabled.
 
 ## 5. Commands
 
-- `merge` — discover + validate + mount overlays over `/usr` & `/opt`
-  (confext: `/etc`). **Fails if already merged.** No extensions found → no-op
-  (exit 0, message).
-- `unmerge` — for each hierarchy: if merged-by-us, unmount (detach-lazy
-  fallback), dismantle loop devices, clean workspace.
-- `refresh` — unmerge (if merged) then merge. If no extensions installed →
-  just unmerge. By default skip if merged set already matches
-  (`--always-refresh=yes` forces).
-- `status` (also default with no verb) — table: HIERARCHY / EXTENSIONS /
-  SINCE. Reads `.systemd-sysext/extensions` from each hierarchy. "none" when
-  unmerged.
-- `list` — table of discovered installed images: NAME / TYPE (raw/directory) / PATH / TIME.
-- `--json=short|pretty|off` for status/list.
-- `--root=PATH` — operate relative to alternate root.
-- `--force` — skip version compat checks.
-- `--no-reload`, `--noexec=BOOL` (confext) accepted.
-- Binary behaves as confext when invoked via argv[0] `confext` /
-  `systemd-confext` symlink, or with `--confext` flag (our extension).
+- `merge`: fails with `Hierarchy '%s' is already merged.` when any hierarchy
+  is merged. Discovers, mounts and checks every image once (metadata checks
+  even with `--force`), ignores incompatible ones and merges the rest. With
+  nothing left: `No extensions found.` / `No suitable extensions found (N
+  ignored due to incompatible image(s)).`, exit 0 — or, in a mutable mode,
+  `No extensions found, proceeding in mutable mode.`
+- `refresh`: builds the new merge first and compares origins; unchanged →
+  `Skipping extension refresh because no change was found, use
+  --always-refresh=yes to always do a refresh.`; changed → old merge replaced
+  under one lock (a failure before the swap keeps the old merge); nothing
+  left → unmerge.
+- `unmerge`: unmounts every overlay of the class (stacked ones too),
+  restores submounts, removes the recorded workdirs, releases the
+  workspace. Idempotent.
+- `status` (default verb): HIERARCHY / EXTENSIONS / SINCE table, one
+  extension per line, `-` for empty cells; hierarchies that do not exist
+  are left out. JSON: `{"hierarchy", "extensions": [...], "since": usec|null}`.
+- `list`: NAME / TYPE / PATH / TIME, sorted by name (`strcmp`); `No OS
+  extensions found.` on stderr when empty (JSON: `[]`).
+- merge, unmerge and refresh need the effective `CAP_SYS_ADMIN`.
+- `--json=short|pretty` follows sd_json formatting; messages go to stderr,
+  plain, filtered by `SYSTEMD_LOG_LEVEL` (default info). Errors use C
+  `strerror()` wording. `Using extensions '…'.` is printed before the
+  overlays are mounted; any failure while merging ends with `Failed to merge
+  hierarchies` (not metadata failures and not "already merged"). A refresh
+  whose cleanup fails after the new merge went live reports the merge, then
+  `Extensions merged, but failed to clean up …`, and exits 1.
+- SIGINT, SIGTERM and SIGHUP are held while mounts are being changed and
+  delivered afterwards.
 
 ## 6. Alpine integration
 
-- Static musl build: `CGO_ENABLED=0 go build`.
-- OpenRC service `/etc/init.d/sysext` (and `confext`): `start` = merge,
-  `stop` = unmerge. Runs after `localmount`.
-- Marker paths intentionally keep the `systemd` name for interop with images
-  and tooling that probe `/run/systemd/sysext` & `.systemd-sysext`.
+- Static build: `CGO_ENABLED=0 go build`.
+- OpenRC services `sysext` and `confext` (boot runlevel): `start` and
+  `reload` run `refresh`, `stop` runs `unmerge` (with `--no-reload` while
+  the system goes down, `RC_GOINGDOWN`); conf.d `SYSEXT_OPTS` /
+  `CONFEXT_OPTS`; confext defaults to `--noexec=false` because OpenRC
+  executes `/etc/init.d` scripts directly.
+- Kill switch: `systemd.sysext=` / `systemd.confext=` on the kernel command
+  line (`$SYSTEMD_PROC_CMDLINE` overrides it; `rd.` variants inside an
+  initrd) disables every verb when invoked by a service manager
+  (`RC_SVCNAME` or `SYSTEMD_EXEC_PID`): `Disabled by the kernel command line
+  option '%s=', skipping execution.`, exit 0.
+- Service manager step (after merge/refresh, around unmerge; never with
+  `--no-reload`, any `--root`, or without a running OpenRC): extension-release
+  files are read from the merged tree; `EXTENSION_RELOAD_MANAGER=` true or
+  any listed unit → `rc-update -u`; `EXTENSION_RESTART_UNITS=` →
+  `rc-service SVC restart`; `EXTENSION_RELOAD_OR_RESTART_UNITS=` → `reload`
+  when the script defines `reload()`, else `restart`; restart wins over
+  reload-or-restart. Unit names are validated like `unit_name_is_valid()`;
+  `foo.service` → `foo`, `foo@bar.service` → `foo.bar`; other types are
+  ignored with a warning. Before unmerging, started services whose init
+  script comes from an extension tree are stopped.
 
-## 7. Implemented beyond the MVP
+## 7. Out of scope (deliberate)
 
-- Verity / signatures / image policies (docs/VERITY.md)
-- Mutable modes (docs/MUTABLE.md)
-- sysext.conf(5)/confext.conf config files + drop-ins (Mutable=, ImagePolicy=)
-- SYSTEMD_SYSEXT_HIERARCHIES / SYSTEMD_CONFEXT_HIERARCHIES overrides
-- Merge/unmerge serialization via flock on /run/systemd/<class>.lock
-- SYSEXT_SCOPE/CONFEXT_SCOPE enforcement
-- `EXTENSION_RELOAD_MANAGER` → OpenRC dependency-cache refresh
-
-## 8. Out of scope (deliberate)
-
-- initrd integration, `/.extra/sysext` (no systemd-stub flow on Alpine)
+- initrd integration, sysroot services, `/.extra/sysext`
 - LUKS (`encrypted` image-policy term never matches)
-- service-manager reload semantics beyond the OpenRC cache refresh
-- btrfs subvolume special-casing (plain dir handling covers it)
+- Varlink interface, systemd-sysupdate notification, polkit, SELinux labels
+- `.mstack` directories

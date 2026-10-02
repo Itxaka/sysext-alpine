@@ -182,4 +182,4 @@ NOTES
       1. UAPI.2 Discoverable Partitions Specification
          https://uapi-group.org/specifications/specs/discoverable_partitions_specification
 
-systemd 260.2                                           SYSTEMD.IMAGE-POLICY(7)
+systemd 262                                             SYSTEMD.IMAGE-POLICY(7)

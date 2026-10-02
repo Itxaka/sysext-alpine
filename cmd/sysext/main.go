@@ -1,27 +1,44 @@
-// sysext is a standalone reimplementation of systemd-sysext/-confext for
-// systems without systemd (Alpine Linux). Behaves as confext when invoked
-// through an argv[0] containing "confext" or with --confext.
-//
-// Usage: sysext [OPTIONS...] [status|merge|unmerge|refresh|list]
-//
-// Implemented per docs/SPEC.md §5. Stdlib only — no external dependencies.
+// Command sysext is a reimplementation of systemd-sysext and systemd-confext
+// 262 for systems without systemd, such as Alpine Linux with OpenRC. It
+// operates on configuration extensions when invoked through a name
+// containing "confext" or with --confext.
 package main
 
 import (
-	"fmt"
+	"errors"
+	"io"
 	"os"
+
+	"github.com/itxaka/sysext-alpine/internal/service"
 )
 
+// errLogged is returned for failures whose message was logged already.
+var errLogged = errors.New("failure already logged")
+
 func main() {
-	if err := run(os.Args); err != nil {
-		fmt.Fprintf(os.Stderr, "sysext: %v\n", err)
-		os.Exit(1)
-	}
+	os.Exit(run(os.Args, os.Stdout, os.Stderr))
 }
 
-// run dispatches the CLI. Flags (SPEC §5): --root=, --force, --noexec=BOOL,
-// --json=short|pretty|off, --no-reload, --always-refresh=yes|no, --confext,
-// -h/--help, --version. Default verb: status.
-func run(args []string) error {
-	return runWith(args, os.Stdout, os.Stderr)
+// run executes the command line and returns the exit status.
+func run(args []string, stdout, stderr io.Writer) int {
+	log := newLogger(stderr)
+	c := &cli{stdout: stdout, log: log, rc: &service.OpenRC{Log: log}}
+	if err := c.execute(args); err != nil {
+		if !errors.Is(err, errLogged) {
+			log.Errorf("%s", errorText(err))
+		}
+		return 1
+	}
+	return 0
+}
+
+func (c *cli) execute(args []string) error {
+	done, err := c.parseArgs(args)
+	if err != nil || done {
+		return err
+	}
+	if c.disabledByCmdline() {
+		return nil
+	}
+	return c.dispatch()
 }

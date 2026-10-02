@@ -1,4 +1,4 @@
-# Build output (root-level only — examples/ contains a usr/bin payload)
+# Build output
 /bin/
 
 # Test extension images (the signed example is regenerated, not committed:
@@ -10,15 +10,15 @@
 *.out
 coverage.html
 
-# Local test fixtures (real signed images, certificates, PRIVATE KEYS —
-# never commit; see test/fixtures/README.md)
-test/fixtures/*
-!test/fixtures/README.md
+# Local test fixtures (built by test/e2e/fixtures.sh; may hold real signed
+# images, certificates and PRIVATE KEYS — never commit)
+test/fixtures/
 
-# Coverage artifacts
+# Coverage artifacts and e2e logs
 coverage*.out
-coverage.html
 .covdata/
+e2e-logs/
+e2e-artifacts/
 
 # Stray build binary (committed by accident once)
 /sysext

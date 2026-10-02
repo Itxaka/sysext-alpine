@@ -1,0 +1,47 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - copyloopvar
+    - errorlint
+    - exhaustive
+    - gocritic
+    - gosec
+    - intrange
+    - misspell
+    - modernize
+    - nilnesserr
+    - nolintlint
+    - perfsprint
+    - revive
+    - unparam
+    - usestdlibvars
+    - usetesting
+  settings:
+    errcheck:
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (*os.File).Close
+        - os.RemoveAll
+    exhaustive:
+      default-signifies-exhaustive: true
+    gosec:
+      excludes: [G104, G115, G301, G304, G306, G602, G703]
+    revive:
+      rules:
+        - name: package-comments
+        - name: redefines-builtin-id
+  exclusions:
+    presets: [common-false-positives, std-error-handling]
+    rules:
+      - path: _test\.go
+        linters: [gosec, unparam]
+
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/itxaka/sysext-alpine]

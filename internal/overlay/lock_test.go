@@ -9,37 +9,49 @@ import (
 	"github.com/itxaka/sysext-alpine/internal/release"
 )
 
+// withRuntimeDir points the workspaces and locks at a temporary directory.
+func withRuntimeDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "systemd")
+	old := runtimeDir
+	runtimeDir = dir
+	t.Cleanup(func() { runtimeDir = old })
+	return dir
+}
+
 func TestLockPaths(t *testing.T) {
+	dir := withRuntimeDir(t)
 	root := t.TempDir()
 
-	unlockS, err := Lock(release.Sysext, root)
-	if err != nil {
-		t.Fatalf("Lock(sysext): %v", err)
-	}
-	defer unlockS()
-	unlockC, err := Lock(release.Confext, root)
-	if err != nil {
-		t.Fatalf("Lock(confext): %v", err)
-	}
-	defer unlockC()
-
-	for _, name := range []string{"sysext.lock", "confext.lock"} {
-		p := filepath.Join(root, "run/systemd", name)
-		fi, err := os.Stat(p)
+	for _, c := range []struct {
+		class release.Class
+		root  string
+		want  string
+	}{
+		{release.Sysext, "", "sysext.lock"},
+		{release.Confext, "/", "confext.lock"},
+		{release.Sysext, root, filepath.Base(workspaceFor(release.Sysext, root)) + ".lock"},
+	} {
+		unlock, err := Lock(c.class, c.root)
 		if err != nil {
-			t.Fatalf("lock file %s: %v", p, err)
+			t.Fatalf("Lock(%v, %q): %v", c.class, c.root, err)
 		}
-		if got := fi.Mode().Perm(); got != 0o600 {
-			t.Errorf("%s mode = %o, want 0600", p, got)
+		fi, err := os.Stat(filepath.Join(dir, c.want))
+		if err != nil {
+			t.Errorf("lock file %s: %v", c.want, err)
+		} else if got := fi.Mode().Perm(); got != 0o600 {
+			t.Errorf("%s mode = %o, want 0600", c.want, got)
 		}
+		unlock()
+	}
+	if entries, _ := os.ReadDir(root); len(entries) != 0 {
+		t.Errorf("Lock wrote into the root: %v", entries)
 	}
 }
 
 func TestLockBlocksConcurrentHolder(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "run/systemd", "sysext.lock")
-
-	unlock, err := Lock(release.Sysext, root)
+	withRuntimeDir(t)
+	unlock, err := Lock(release.Sysext, "")
 	if err != nil {
 		t.Fatalf("first Lock: %v", err)
 	}
@@ -47,7 +59,7 @@ func TestLockBlocksConcurrentHolder(t *testing.T) {
 	errCh := make(chan error, 1)
 	acquired := make(chan struct{})
 	go func() {
-		u, err := Lock(release.Sysext, root)
+		u, err := Lock(release.Sysext, "")
 		if err != nil {
 			errCh <- err
 			return
@@ -57,7 +69,6 @@ func TestLockBlocksConcurrentHolder(t *testing.T) {
 		errCh <- nil
 	}()
 
-	// The second Lock must block while the first is held.
 	select {
 	case <-acquired:
 		t.Fatal("second Lock acquired while first was held")
@@ -68,10 +79,9 @@ func TestLockBlocksConcurrentHolder(t *testing.T) {
 
 	unlock()
 
-	// After release it must go through promptly. Don't select on errCh
-	// here: on success the goroutine both closes acquired AND sends nil to
-	// errCh, and select picks randomly among ready channels — selecting
-	// the nil error would be a spurious failure (seen on slow CI runners).
+	// On success the goroutine both closes acquired and sends nil to
+	// errCh; select picks randomly among ready channels, so only acquired
+	// is waited for here.
 	select {
 	case <-acquired:
 	case <-time.After(5 * time.Second):
@@ -85,20 +95,29 @@ func TestLockBlocksConcurrentHolder(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatalf("second unlock path: %v", err)
 	}
-
-	// The lock file must survive unlock — deleting it would be racy.
-	if _, err := os.Stat(path); err != nil {
-		t.Errorf("lock file removed by unlock: %v", err)
-	}
 }
 
-func TestLockSequentialReacquire(t *testing.T) {
-	root := t.TempDir()
-	for i := 0; i < 3; i++ {
-		unlock, err := Lock(release.Confext, root)
-		if err != nil {
-			t.Fatalf("Lock round %d: %v", i, err)
+func TestLockClassesIndependent(t *testing.T) {
+	withRuntimeDir(t)
+	unlock, err := Lock(release.Sysext, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	done := make(chan error, 1)
+	go func() {
+		u, err := Lock(release.Confext, "")
+		if err == nil {
+			u()
 		}
-		unlock()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("confext lock blocked by the sysext lock")
 	}
 }

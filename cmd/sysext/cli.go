@@ -1,29 +1,29 @@
-// CLI argument parsing and verb dispatch for sysext/confext (SPEC §5).
-//
-// Flag parsing is hand-rolled (GNU getopt_long style) so that
-// --flag=value and --flag value both work and error messages can mimic
-// systemd/getopt output exactly.
 package main
 
 import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 
+	"golang.org/x/sys/unix"
+
 	extconf "github.com/itxaka/sysext-alpine/internal/config"
-	"github.com/itxaka/sysext-alpine/internal/discover"
 	"github.com/itxaka/sysext-alpine/internal/image"
 	"github.com/itxaka/sysext-alpine/internal/overlay"
 	"github.com/itxaka/sysext-alpine/internal/release"
+	"github.com/itxaka/sysext-alpine/internal/service"
 )
 
 // version is the build version, injected via -ldflags "-X main.version=...".
 var version = "0.1.0"
+
+// systemdVersion is the systemd-sysext release whose interface is
+// implemented.
+const systemdVersion = "262"
 
 // JSON output modes (--json=).
 const (
@@ -32,232 +32,356 @@ const (
 	jsonPretty = "pretty"
 )
 
-// config is the fully parsed command line.
-type config struct {
-	progName      string
-	class         release.Class
-	root          string // --root=
-	force         bool   // --force
-	noExec        bool   // --noexec= (default true; only meaningful for confext)
-	jsonMode      string // --json=short|pretty|off
-	noReload      bool   // --no-reload (suppress OpenRC dependency-cache refresh)
-	alwaysRefresh bool   // --always-refresh=yes|no
-	mutable       string // --mutable= mode (default "no")
-	imagePolicy   string // --image-policy= (raw policy string; "" = default)
-	noLegend      bool   // --no-legend
-	showHelp      bool   // -h/--help
-	showVersion   bool   // --version
-	verb          string // status|merge|unmerge|refresh|list
-
-	// mutableSet/imagePolicySet record whether the corresponding option was
-	// given explicitly on the command line. When false, the value from
-	// sysext.conf(5) (if any) applies, falling back to the built-in default.
-	mutableSet     bool
-	imagePolicySet bool
+// option is one command line option, in systemd's option table order.
+type option struct {
+	short   byte
+	long    string
+	metavar string // argument name; "" for options without argument
+	help    string // "" hides the option from --help
 }
 
-// classFromArgv0 selects confext behavior when the binary is invoked through
-// a name containing "confext" (e.g. a confext or systemd-confext symlink).
-func classFromArgv0(argv0 string) release.Class {
-	if strings.Contains(filepath.Base(argv0), "confext") {
+var options = []option{
+	{'h', "help", "", "Show this help"},
+	{0, "version", "", "Show package version"},
+	{0, "root", "PATH", "Operate relative to root PATH"},
+	{0, "mutable", "MODE", "Specify a mutability mode (yes, no, auto, import, ephemeral, ephemeral-import, help)"},
+	{0, "image-policy", "POLICY", "Specify disk image dissection policy"},
+	{0, "noexec", "BOOL", "Whether to mount extension overlay with noexec"},
+	{0, "force", "", "Ignore version incompatibilities"},
+	{0, "no-reload", "", "Do not reload the service manager (OpenRC)"},
+	{0, "always-refresh", "BOOL", "Whether to refresh when no changes were found"},
+	{0, "no-pager", "", "Do not start a pager"},
+	{0, "no-legend", "", "Do not show headers and footers"},
+	{0, "json", "FORMAT", "Generate JSON output (pretty, short, or off)"},
+	{0, "confext", "", "Operate on configuration extensions in /etc/"},
+	{0, "introspect-cli", "", ""},
+}
+
+// verb is one command verb; the first is the default.
+type verb struct {
+	name string
+	help string // "" hides the verb from --help
+}
+
+var verbs = []verb{
+	{"status", "Show current merge status (default)"},
+	{"merge", "Merge extensions into relevant hierarchies"},
+	{"unmerge", "Unmerge extensions from relevant hierarchies"},
+	{"refresh", "Unmerge/merge extensions again"},
+	{"list", "List installed extensions"},
+	{"help", ""},
+}
+
+// mutableModes are the --mutable= modes in systemd's string table order.
+var mutableModes = []string{"no", "yes", "auto", "import", "ephemeral", "ephemeral-import"}
+
+// config is the parsed command line.
+type config struct {
+	progName       string // for option parser errors
+	class          release.Class
+	root           string // absolute --root=, "" for the host
+	force          bool
+	noReload       bool // --no-reload or any --root=
+	alwaysRefresh  bool
+	noExec         int // overlay.NoExecDefault, NoExecOff or NoExecOn
+	jsonMode       string
+	legend         bool
+	mutable        string
+	mutableSet     bool
+	imagePolicy    string // "" for the class default
+	imagePolicySet bool
+	args           []string
+}
+
+// cli is one invocation.
+type cli struct {
+	cfg    *config
+	stdout io.Writer
+	log    *logger
+	rc     *service.OpenRC
+
+	// Set up for the verbs operating on hierarchies (loadContext).
+	hierarchies  []string
+	mountOptions *string // nil when the environment does not set any
+}
+
+// errorText renders an error as a log line. Failures are worded already.
+// Messages from other packages are capitalized like systemd's, and an errno
+// they end in is described in the C library's words instead of Go's, as
+// systemd's %m does.
+func errorText(err error) string {
+	s := err.Error()
+	if _, ok := errors.AsType[*failure](err); ok || s == "" {
+		return s
+	}
+	if e, text := errnoOf(err); text != "" && strings.HasSuffix(s, text) {
+		s = strings.TrimSuffix(s, text) + strerror(e)
+	}
+	return capitalize(s)
+}
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// classFromInvocation selects confext behaviour when the program is invoked
+// through a name containing "confext" ($SYSTEMD_INVOKED_AS, else argv[0]),
+// like systemd's invoked_as().
+func classFromInvocation(argv0 string) release.Class {
+	name := os.Getenv("SYSTEMD_INVOKED_AS")
+	if name == "" {
+		name = argv0
+	}
+	if strings.Contains(filepath.Base(name), "confext") {
 		return release.Confext
 	}
 	return release.Sysext
 }
 
-// parseBool accepts systemd parse_boolean() spellings.
-func parseBool(s string) (bool, error) {
-	switch strings.ToLower(s) {
-	case "1", "yes", "y", "true", "t", "on":
-		return true, nil
-	case "0", "no", "n", "false", "f", "off":
-		return false, nil
+// classIdentifier is "sysext" or "confext".
+func classIdentifier(class release.Class) string {
+	if class == release.Confext {
+		return "confext"
 	}
-	return false, fmt.Errorf("invalid boolean value '%s'", s)
+	return "sysext"
 }
 
-// parseMutableMode normalizes a --mutable= argument: boolean spellings map
-// to yes/no, the named modes and "help" pass through.
-func parseMutableMode(s string) (string, error) {
-	switch s {
-	case "auto", "import", "ephemeral", "ephemeral-import", "help":
-		return s, nil
-	}
-	b, err := parseBool(s)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse --mutable= argument: invalid mode '%s'", s)
-	}
-	if b {
-		return "yes", nil
-	}
-	return "no", nil
-}
-
-// parseArgs parses the full argv (args[0] = program name). -h/--help and
-// --version short-circuit, like getopt-based systemd tools.
-func parseArgs(args []string) (*config, error) {
-	cfg := &config{
-		progName: "sysext",
-		noExec:   true,
-		jsonMode: jsonOff,
-		verb:     "status",
-	}
-	if len(args) > 0 && args[0] != "" {
+// parseArgs parses argv like systemd's option parser: options and positional
+// arguments may be mixed, "--" ends the options, -h may be combined with
+// other short options and unambiguous prefixes of long options are
+// accepted. Options that print something (help, --version, --mutable=help,
+// --json=help, --introspect-cli) end the program when parsed, done reports
+// that.
+func (c *cli) parseArgs(args []string) (done bool, err error) {
+	cfg := &config{progName: "sysext", noExec: overlay.NoExecDefault, jsonMode: jsonOff, legend: true}
+	if len(args) > 0 {
 		cfg.progName = filepath.Base(args[0])
-		cfg.class = classFromArgv0(args[0])
+		cfg.class = classFromInvocation(args[0])
 	}
-
-	var positional []string
+	c.cfg = cfg
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
-
-		if arg == "--" { // end of options
-			positional = append(positional, args[i+1:]...)
-			break
-		}
-		if arg == "-h" {
-			cfg.showHelp = true
-			return cfg, nil
-		}
-		if !strings.HasPrefix(arg, "--") {
-			if strings.HasPrefix(arg, "-") && len(arg) > 1 {
-				return nil, fmt.Errorf("unrecognized option '%s'", arg)
+		switch {
+		case arg == "--":
+			cfg.args = append(cfg.args, args[i+1:]...)
+			return false, nil
+		case strings.HasPrefix(arg, "--"):
+			optname, value, hasValue := strings.Cut(arg, "=")
+			opt, err := c.lookupOption(optname)
+			if err != nil {
+				return false, err
 			}
-			positional = append(positional, arg)
-			continue
-		}
-
-		name, value, hasValue := strings.Cut(arg[2:], "=")
-
-		var takesValue bool
-		switch name {
-		case "root", "noexec", "json", "always-refresh", "mutable",
-			"image-policy":
-			takesValue = true
-		case "force", "no-reload", "no-pager", "no-legend", "confext",
-			"help", "version":
-			takesValue = false
+			switch {
+			case hasValue && opt.metavar == "":
+				return false, failMsg("%s: option '%s' doesn't allow an argument", cfg.progName, optname)
+			case !hasValue && opt.metavar != "":
+				if i+1 >= len(args) {
+					return false, failMsg("%s: option '%s' requires an argument", cfg.progName, optname)
+				}
+				i++
+				value = args[i]
+			}
+			if done, err := c.handleOption(opt, value); done || err != nil {
+				return done, err
+			}
+		case len(arg) > 1 && arg[0] == '-':
+			// -h is the only short option and ends the parsing.
+			if arg[1] != 'h' {
+				return false, failMsg("%s: unrecognized option '-%c'", cfg.progName, arg[1])
+			}
+			return c.handleOption(options[0], "")
 		default:
-			return nil, fmt.Errorf("unrecognized option '--%s'", name)
-		}
-		if takesValue && !hasValue {
-			i++
-			if i >= len(args) {
-				return nil, fmt.Errorf("option '--%s' requires an argument", name)
-			}
-			value = args[i]
-		}
-		if !takesValue && hasValue {
-			return nil, fmt.Errorf("option '--%s' doesn't allow an argument", name)
-		}
-
-		switch name {
-		case "help":
-			cfg.showHelp = true
-			return cfg, nil
-		case "version":
-			cfg.showVersion = true
-			return cfg, nil
-		case "root":
-			cfg.root = value
-		case "force":
-			cfg.force = true
-		case "noexec":
-			b, err := parseBool(value)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse --noexec= argument: %w", err)
-			}
-			cfg.noExec = b
-		case "json":
-			switch value {
-			case jsonShort, jsonPretty, jsonOff:
-				cfg.jsonMode = value
-			default:
-				return nil, fmt.Errorf("unknown JSON output format '%s'", value)
-			}
-		case "no-reload":
-			cfg.noReload = true
-		case "always-refresh":
-			b, err := parseBool(value)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse --always-refresh= argument: %w", err)
-			}
-			cfg.alwaysRefresh = b
-		case "mutable":
-			m, err := parseMutableMode(value)
-			if err != nil {
-				return nil, err
-			}
-			if m == "help" {
-				cfg.showHelp = true // caller prints the list via usage
-				return cfg, nil
-			}
-			cfg.mutable = m
-			cfg.mutableSet = true
-		case "image-policy":
-			cfg.imagePolicy = value
-			cfg.imagePolicySet = true
-		case "no-pager":
-			// Accepted for compatibility; we never page output.
-		case "no-legend":
-			cfg.noLegend = true
-		case "confext":
-			cfg.class = release.Confext
+			cfg.args = append(cfg.args, arg)
 		}
 	}
+	return false, nil
+}
 
-	switch len(positional) {
+// lookupOption finds the long option optname ("--name"): an exact match, or
+// the only option the name is a prefix of.
+func (c *cli) lookupOption(optname string) (option, error) {
+	name := optname[2:]
+	if name == "" {
+		return option{}, failMsg("%s: unrecognized option '%s'", c.cfg.progName, optname)
+	}
+	var partial []option
+	for _, o := range options {
+		if o.long == name {
+			return o, nil
+		}
+		if strings.HasPrefix(o.long, name) {
+			partial = append(partial, o)
+		}
+	}
+	switch len(partial) {
 	case 0:
-		// default verb: status
+		return option{}, failMsg("%s: unrecognized option '%s'", c.cfg.progName, optname)
 	case 1:
-		switch positional[0] {
-		case "status", "merge", "unmerge", "refresh", "list":
-			cfg.verb = positional[0]
-		default:
-			return nil, fmt.Errorf("unknown command verb '%s'", positional[0])
+		return partial[0], nil
+	}
+	names := make([]string, len(partial))
+	for i, o := range partial {
+		names[i] = "--" + o.long
+	}
+	return option{}, failMsg("%s: option '%s' is ambiguous; possibilities: %s", c.cfg.progName, optname, strings.Join(names, ", "))
+}
+
+func (c *cli) handleOption(opt option, value string) (done bool, err error) {
+	cfg := c.cfg
+	switch opt.long {
+	case "help":
+		c.printHelp()
+		return true, nil
+	case "version":
+		fmt.Fprintf(c.stdout, "sysext-alpine %s (systemd-sysext %s)\n", version, systemdVersion)
+		return true, nil
+	case "root":
+		cfg.root = ""
+		if value != "" {
+			abs, err := filepath.Abs(value)
+			if err != nil {
+				return false, failf(err, "Failed to parse path \"%s\" and make it absolute", value)
+			}
+			cfg.root = abs
 		}
-	default:
-		return nil, errors.New("too many arguments")
+		// With --root= the service manager of the host has nothing to do
+		// with the extensions.
+		cfg.noReload = true
+	case "mutable":
+		if value == "help" {
+			if cfg.legend {
+				fmt.Fprintln(c.stdout, "Known mutability modes:")
+			}
+			fmt.Fprintln(c.stdout, strings.Join(mutableModes, "\n"))
+			return true, nil
+		}
+		m, err := extconf.ParseMutable(value)
+		if err != nil {
+			return false, failMsg("Failed to parse argument to --mutable=: %s", value)
+		}
+		cfg.mutable, cfg.mutableSet = m, true
+	case "image-policy":
+		if value == "" {
+			value = "-"
+		}
+		if err := image.ValidatePolicy(value); err != nil {
+			return false, policyError(err, value)
+		}
+		cfg.imagePolicy, cfg.imagePolicySet = value, true
+	case "noexec":
+		b, err := parseBooleanArgument(opt.long, value)
+		if err != nil {
+			return false, err
+		}
+		cfg.noExec = overlay.NoExecOff
+		if b {
+			cfg.noExec = overlay.NoExecOn
+		}
+	case "force":
+		cfg.force = true
+	case "no-reload":
+		cfg.noReload = true
+	case "always-refresh":
+		b, err := parseBooleanArgument(opt.long, value)
+		if err != nil {
+			return false, err
+		}
+		cfg.alwaysRefresh = b
+	case "no-pager":
+	case "no-legend":
+		cfg.legend = false
+	case "json":
+		switch value {
+		case jsonPretty, jsonShort, jsonOff:
+			cfg.jsonMode = value
+		case "help":
+			fmt.Fprintln(c.stdout, "pretty\nshort\noff")
+			return true, nil
+		default:
+			return false, failMsg("Unknown argument to --json= switch: %s", value)
+		}
+	case "confext":
+		cfg.class = release.Confext
+	case "introspect-cli":
+		fmt.Fprint(c.stdout, formatJSON(introspection(), cfg.jsonMode == jsonPretty))
+		return true, nil
 	}
-	return cfg, nil
+	return false, nil
 }
 
-// cli bundles parsed config with output streams for testability.
-type cli struct {
-	cfg    *config
-	stdout io.Writer
-	stderr io.Writer
+func parseBooleanArgument(name, value string) (bool, error) {
+	b, err := release.ParseBoolean(value)
+	if err != nil {
+		return false, failMsg("Failed to parse boolean argument to '--%s': %s", name, value)
+	}
+	return b, nil
 }
 
-// runWith is the testable core of run().
-func runWith(args []string, stdout, stderr io.Writer) error {
-	cfg, err := parseArgs(args)
-	if err != nil {
-		return err
+// policyError words an invalid --image-policy= like
+// parse_image_policy_argument().
+func policyError(err error, policy string) error {
+	switch {
+	case errors.Is(err, unix.ENOTUNIQ):
+		return failMsg("Duplicate rule in image policy: %s", policy)
+	case errors.Is(err, unix.EBADSLT):
+		return failMsg("Unknown partition type in image policy: %s", policy)
+	case errors.Is(err, unix.EBADRQC):
+		return failMsg("Unknown partition policy flag in image policy: %s", policy)
 	}
-	if cfg.showHelp {
-		printUsage(stdout, cfg)
+	return failMsg("Failed to parse image policy: %s", policy)
+}
+
+// disabledByCmdline implements the kernel command line switch
+// systemd.sysext= (systemd.confext=, rd.-prefixed in the initrd): when it
+// is false and the program runs as a service, nothing is done.
+func (c *cli) disabledByCmdline() bool {
+	inInitrd := c.cfg.root == "" && service.InInitrd()
+	key := "systemd." + classIdentifier(c.cfg.class)
+	if inInitrd {
+		key = "rd." + key
+	}
+	words, err := service.KernelCmdline()
+	enabled := true
+	if err == nil {
+		enabled, err = service.CmdlineBool(words, key, inInitrd)
+	}
+	if err != nil {
+		c.log.Debugf("Failed to check '%s=' kernel command line option, proceeding: %s", key, strerror(err))
+		return false
+	}
+	if enabled || !service.InvokedByServiceManager() {
+		return false
+	}
+	c.log.Noticef("Disabled by the kernel command line option '%s=', skipping execution.", key)
+	return true
+}
+
+func (c *cli) dispatch() error {
+	name := verbs[0].name
+	if len(c.cfg.args) > 0 {
+		name = c.cfg.args[0]
+	}
+	if name == "help" {
+		c.printHelp()
 		return nil
 	}
-	if cfg.showVersion {
-		fmt.Fprintf(stdout, "%s %s\n", cfg.progName, version)
-		return nil
+	known := false
+	for _, v := range verbs {
+		known = known || v.name == name
 	}
-
-	// sysext.conf(5): file configuration provides defaults; explicit
-	// command-line options take precedence.
-	fileCfg, err := extconf.Load(cfg.class, cfg.root)
-	if err != nil {
-		return fmt.Errorf("failed to load configuration: %w", err)
+	if !known {
+		if closest := closestVerb(name); closest != "" {
+			return failMsg("Unknown command verb '%s', did you mean '%s'?", name, closest)
+		}
+		return failMsg("Unknown command verb '%s'.", name)
 	}
-	if err := applyFileConfig(cfg, fileCfg); err != nil {
-		return err
+	if len(c.cfg.args) > 1 {
+		return failMsg("Too many arguments.")
 	}
-
-	c := &cli{cfg: cfg, stdout: stdout, stderr: stderr}
-	switch cfg.verb {
-	case "status":
-		return c.cmdStatus()
+	switch name {
 	case "merge":
 		return c.cmdMerge()
 	case "unmerge":
@@ -267,377 +391,168 @@ func runWith(args []string, stdout, stderr io.Writer) error {
 	case "list":
 		return c.cmdList()
 	}
-	// Unreachable: parseArgs validates the verb.
-	return fmt.Errorf("unknown command verb '%s'", cfg.verb)
+	return c.cmdStatus()
 }
 
-// applyFileConfig fills options not given explicitly on the command line
-// from the sysext.conf(5)/confext.conf(5) configuration, falling back to the
-// built-in defaults (Mutable=no, no image policy). Config-supplied Mutable=
-// values are validated like --mutable=, except that "help" is rejected.
-func applyFileConfig(cfg *config, fileCfg extconf.Config) error {
-	if !cfg.mutableSet {
-		cfg.mutable = "no" // built-in default
-		if fileCfg.Mutable != "" {
-			m, err := parseMutableMode(fileCfg.Mutable)
-			if err != nil || m == "help" {
-				return fmt.Errorf("invalid Mutable= value '%s' in configuration file", fileCfg.Mutable)
+// closestVerb is strv_find_closest(): the verb name starts with with the
+// fewest characters left over, else the nearest by Levenshtein distance (at
+// most 5).
+func closestVerb(name string) string {
+	best, bestLen := "", -1
+	for _, v := range verbs {
+		if rest, ok := strings.CutPrefix(v.name, name); ok && (bestLen < 0 || len(rest) < bestLen) {
+			best, bestLen = v.name, len(rest)
+		}
+	}
+	if best != "" {
+		return best
+	}
+	bestDist := -1
+	for _, v := range verbs {
+		d := levenshtein(v.name, name)
+		if d <= 5 && (bestDist < 0 || d < bestDist) {
+			best, bestDist = v.name, d
+		}
+	}
+	return best
+}
+
+// levenshtein is systemd's strlevenshtein(), which also counts a swap of
+// two adjacent characters as one edit.
+func levenshtein(x, y string) int {
+	if x == y {
+		return 0
+	}
+	if x == "" {
+		return len(y)
+	}
+	if y == "" {
+		return len(x)
+	}
+	t0 := make([]int, len(y)+1)
+	t1 := make([]int, len(y)+1)
+	t2 := make([]int, len(y)+1)
+	for i := range t1 {
+		t1[i] = i
+	}
+	for i := range len(x) {
+		t2[0] = i + 1
+		for j := range len(y) {
+			t2[j+1] = t1[j]
+			if x[i] != y[j] {
+				t2[j+1]++
 			}
-			cfg.mutable = m
+			if i > 0 && j > 0 && x[i-1] == y[j] && x[i] == y[j-1] && t2[j+1] > t0[j-1]+1 {
+				t2[j+1] = t0[j-1] + 1
+			}
+			t2[j+1] = min(t2[j+1], t1[j+1]+1, t2[j]+1)
 		}
+		t0, t1, t2 = t1, t2, t0
 	}
-	if !cfg.imagePolicySet && fileCfg.ImagePolicy != "" {
-		cfg.imagePolicy = fileCfg.ImagePolicy
-	}
-	return nil
+	return t1[len(y)]
 }
 
-// printUsage emits help modeled after `systemd-sysext --help`.
-func printUsage(w io.Writer, cfg *config) {
-	what, hier := "extension images", "/usr/ and /opt/"
-	if cfg.class == release.Confext {
-		what, hier = "configuration extension images", "/etc/"
-	}
-	fmt.Fprintf(w, `%s [OPTIONS...] COMMAND
-
-Merge %s into %s.
-
-Commands:
-  status                   Show current merge status (default)
-  merge                    Merge extensions into %s
-  unmerge                  Unmerge extensions from %s
-  refresh                  Unmerge and merge extensions again
-  list                     List installed extensions
-  -h --help                Show this help
-     --version             Show package version
-
-Options:
-     --root=PATH           Operate relative to root path
-     --force               Ignore version incompatibilities
-     --noexec=BOOL         Whether to mount extension overlay with noexec
-     --no-reload           Do not reload the service manager (OpenRC
-                           dependency cache) after merging
-     --always-refresh=yes|no
-                           Refresh even when the merged set is unchanged
-     --mutable=no|auto|yes|import|ephemeral|ephemeral-import
-                           Set mutability mode (default: no)
-     --image-policy=POLICY Apply image dissection policy to disk images
-     --confext             Operate on configuration extensions (/etc/)
-     --no-pager            Do not pipe output into a pager
-     --no-legend           Do not show the headers and footers
-     --json=pretty|short|off
-                           Generate JSON output
-`, cfg.progName, what, hier, hier, hier)
-}
-
-// mustBeRoot guards verbs that mount/unmount.
-func mustBeRoot() error {
-	if os.Geteuid() != 0 {
-		return errors.New("need to be root")
-	}
-	return nil
-}
-
-// noteNoReload emits the debug note when --no-reload suppresses the service
-// manager reload (OpenRC dependency-cache refresh).
-func (c *cli) noteNoReload() {
-	if c.cfg.noReload {
-		fmt.Fprintln(c.stderr,
-			"Debug: --no-reload specified, skipping service manager reload.")
-	}
-}
-
-// wantsReload reports whether one extension-release requests a service
-// manager reload via EXTENSION_RELOAD_MANAGER=1 (systemd semantics; the
-// value is compared after trimming whitespace).
-func wantsReload(ext release.Fields) bool {
-	return strings.TrimSpace(ext["EXTENSION_RELOAD_MANAGER"]) == "1"
-}
-
-// shouldReloadManager is the pure reload decision: reload only when at least
-// one merged extension requested it and --no-reload was not given.
-func shouldReloadManager(requested, noReload bool) bool {
-	return requested && !noReload
-}
-
-// reloadServiceManager is the OpenRC analog of systemd's manager reload:
-// refresh the service dependency cache (`rc-update -u`) so init scripts
-// shipped by extensions (especially confexts adding /etc/init.d entries) are
-// picked up. Skipped silently (with a debug note) when rc-update is not in
-// PATH or <root>/run/openrc does not exist — i.e. not a (running) OpenRC
-// system. A failed refresh is reported as a warning, not an error.
-func (c *cli) reloadServiceManager() {
-	if _, err := os.Stat(filepath.Join(c.cfg.root, "/run/openrc")); err != nil {
-		fmt.Fprintln(c.stderr,
-			"Debug: /run/openrc not found, skipping service manager reload.")
-		return
-	}
-	rcUpdate, err := exec.LookPath("rc-update")
+// loadContext is systemd's context_from_cmdline(): the hierarchies, then
+// the mutable mode and overlayfs mount options from the environment, then
+// the configuration files; the command line wins over the environment,
+// which wins over the configuration. Problems with the environment or the
+// configuration are only warned about.
+func (c *cli) loadContext() error {
+	class := c.cfg.class
+	id := classIdentifier(class)
+	hierarchies, err := overlay.Hierarchies(class)
 	if err != nil {
-		fmt.Fprintln(c.stderr,
-			"Debug: rc-update not found in PATH, skipping service manager reload.")
-		return
+		return failf(err, "Failed to determine %s hierarchies", id)
 	}
-	if out, err := exec.Command(rcUpdate, "-u").CombinedOutput(); err != nil {
-		fmt.Fprintf(c.stderr, "Warning: failed to refresh OpenRC dependency cache: %v: %s\n",
-			err, strings.TrimSpace(string(out)))
-	}
-}
+	c.hierarchies = hierarchies
 
-// maybeReloadManager applies the reload decision after a successful merge.
-func (c *cli) maybeReloadManager(requested bool) {
-	if c.cfg.noReload {
-		c.noteNoReload()
-		return
-	}
-	if shouldReloadManager(requested, c.cfg.noReload) {
-		c.reloadServiceManager()
-	}
-}
-
-// cmdStatus implements `status` (also the default verb).
-func (c *cli) cmdStatus() error {
-	statuses, err := overlay.CurrentStatus(c.cfg.class, c.cfg.root)
-	if err != nil {
-		return err
-	}
-	sortStatuses(statuses) // alphabetical hierarchy order, like systemd
-	if c.cfg.jsonMode != jsonOff {
-		out, err := renderJSON(toStatusJSON(statuses), c.cfg.jsonMode)
-		if err != nil {
-			return err
-		}
-		fmt.Fprint(c.stdout, out)
-		return nil
-	}
-	fmt.Fprint(c.stdout, formatTable(
-		[]string{"HIERARCHY", "EXTENSIONS", "SINCE"},
-		statusRows(statuses), c.cfg.noLegend))
-	return nil
-}
-
-// cmdList implements `list`.
-func (c *cli) cmdList() error {
-	images, err := discover.Discover(c.cfg.class, c.cfg.root)
-	if err != nil {
-		return err
-	}
-	entries := toListEntries(images)
-	if c.cfg.jsonMode != jsonOff {
-		out, err := renderJSON(entries, c.cfg.jsonMode)
-		if err != nil {
-			return err
-		}
-		fmt.Fprint(c.stdout, out)
-		return nil
-	}
-	if len(entries) == 0 {
-		fmt.Fprintln(c.stdout, "No extensions found.")
-		return nil
-	}
-	fmt.Fprint(c.stdout, formatTable(
-		[]string{"NAME", "TYPE", "PATH", "TIME"},
-		listRows(entries), c.cfg.noLegend))
-	return nil
-}
-
-// cmdMerge implements `merge`: discover, refuse if already merged, validate
-// compatibility (unless --force), then hand over to overlay.Merge.
-func (c *cli) cmdMerge() error {
-	if err := mustBeRoot(); err != nil {
-		return err
-	}
-	images, err := discover.Discover(c.cfg.class, c.cfg.root)
-	if err != nil {
-		return err
-	}
-	if len(images) == 0 {
-		fmt.Fprintln(c.stdout, "No extensions found.")
-		return nil
-	}
-	for _, h := range overlay.Hierarchies(c.cfg.class) {
-		merged, err := overlay.IsMergedByUs(c.cfg.class, c.cfg.root, h)
-		if err != nil {
-			return err
-		}
-		if merged {
-			return fmt.Errorf("hierarchy '%s' is already merged", h)
+	envSet := false
+	modeEnv := "SYSTEMD_" + strings.ToUpper(id) + "_MUTABLE_MODE"
+	if v, ok := os.LookupEnv(modeEnv); ok {
+		m, err := extconf.ParseMutable(v)
+		switch {
+		case err != nil:
+			c.log.Warnf("Failed to parse %s environment variable value '%s'. Ignoring.", modeEnv, v)
+		case !c.cfg.mutableSet:
+			c.cfg.mutable, envSet = m, true
 		}
 	}
-	return c.merge(images)
-}
+	if v, ok := os.LookupEnv("SYSTEMD_" + strings.ToUpper(id) + "_OVERLAYFS_MOUNT_OPTIONS"); ok {
+		c.mountOptions = &v
+	}
 
-// cmdUnmerge implements `unmerge`. overlay.Unmerge is idempotent.
-//
-// Divergence from systemd: systemd also reloads the service manager on
-// unmerge when the previously merged set had requested it. Detecting that
-// here would require re-reading the extension-release files of the images
-// recorded in the marker origin before unmerging; we skip reload detection
-// on unmerge entirely (the --no-reload note is still printed).
-func (c *cli) cmdUnmerge() error {
-	if err := mustBeRoot(); err != nil {
+	fileCfg, messages := extconf.Load(class, c.cfg.root, func(s string) error {
+		_, err := image.NormalizePolicy(s)
 		return err
-	}
-	if err := overlay.Unmerge(c.cfg.class, c.cfg.root); err != nil {
-		return err
-	}
-	c.noteNoReload()
-	return nil
-}
-
-// cmdRefresh implements `refresh`: no images -> plain unmerge; unchanged
-// merged set (and not --always-refresh) -> skip; else unmerge + merge.
-func (c *cli) cmdRefresh() error {
-	if err := mustBeRoot(); err != nil {
-		return err
-	}
-	images, err := discover.Discover(c.cfg.class, c.cfg.root)
-	if err != nil {
-		return err
-	}
-	if len(images) == 0 {
-		if err := overlay.Unmerge(c.cfg.class, c.cfg.root); err != nil {
-			return err
-		}
-		c.noteNoReload()
-		return nil
-	}
-
-	names := make([]string, 0, len(images))
-	for _, img := range images {
-		names = append(names, img.Name)
-	}
-	var mergedSets [][]string
-	for _, h := range overlay.Hierarchies(c.cfg.class) {
-		merged, err := overlay.MergedExtensions(c.cfg.class, c.cfg.root, h)
-		if err != nil {
-			return err
-		}
-		mergedSets = append(mergedSets, merged)
-	}
-	if shouldSkipRefresh(names, mergedSets, c.cfg.alwaysRefresh) {
-		fmt.Fprintln(c.stdout, "Skipping refresh, extensions already merged.")
-		return nil
-	}
-
-	// Unmerge first (no-op when nothing is merged), then merge fresh.
-	if err := overlay.Unmerge(c.cfg.class, c.cfg.root); err != nil {
-		return err
-	}
-	return c.merge(images)
-}
-
-// shouldSkipRefresh is the pure skip decision for `refresh`: skip when at
-// least one hierarchy is merged and every merged hierarchy's recorded
-// extension list matches the discovered image names exactly (in order).
-// --always-refresh=yes disables skipping. mergedSets holds the per-hierarchy
-// MergedExtensions results (empty/nil entries = hierarchy not merged).
-func shouldSkipRefresh(discovered []string, mergedSets [][]string, alwaysRefresh bool) bool {
-	if alwaysRefresh {
-		return false
-	}
-	anyMerged := false
-	for _, merged := range mergedSets {
-		if len(merged) == 0 {
-			continue
-		}
-		anyMerged = true
-		if !slices.Equal(merged, discovered) {
-			return false
-		}
-	}
-	return anyMerged
-}
-
-// merge validates (unless --force) and mounts the overlays, then refreshes
-// the service manager (OpenRC dependency cache) if any merged extension
-// requested it via EXTENSION_RELOAD_MANAGER=1.
-//
-// Divergence from systemd: with --force validation is skipped entirely, so
-// the extension-release files are never read and EXTENSION_RELOAD_MANAGER
-// detection is skipped too (systemd still reads the files when forcing).
-func (c *cli) merge(images []discover.Image) error {
-	arch := release.HostArchitecture()
-	reloadRequested := false
-	if !c.cfg.force {
-		var err error
-		reloadRequested, err = c.validateImages(images, arch)
-		if err != nil {
-			return err
-		}
-	}
-	err := overlay.Merge(c.cfg.class, images, overlay.MergeOptions{
-		Root:        c.cfg.root,
-		NoExec:      c.cfg.noExec,
-		Force:       c.cfg.force,
-		Arch:        arch,
-		Mutable:     c.cfg.mutable,
-		ImagePolicy: c.cfg.imagePolicy,
 	})
-	if err != nil {
-		return err
+	for _, m := range messages {
+		c.log.Warnf("%s", m)
 	}
-	c.maybeReloadManager(reloadRequested)
+	if !c.cfg.mutableSet && !envSet {
+		c.cfg.mutable = fileCfg.Mutable
+		if c.cfg.mutable == "" {
+			c.cfg.mutable = "no"
+		}
+	}
+	if !c.cfg.imagePolicySet {
+		c.cfg.imagePolicy, _ = image.NormalizePolicy(fileCfg.ImagePolicy)
+	}
 	return nil
 }
 
-// validateImages checks every image's extension-release against the host
-// os-release (SPEC §2). Directory images are inspected in place; raw images
-// must be mounted first to expose their release file. The boolean result
-// reports whether any extension requested a service manager reload via
-// EXTENSION_RELOAD_MANAGER=1.
-func (c *cli) validateImages(images []discover.Image, arch string) (bool, error) {
-	host, err := release.HostOSRelease(c.cfg.root)
-	if err != nil {
-		return false, fmt.Errorf("failed to read host os-release: %w", err)
-	}
-	reloadRequested := false
-	for _, img := range images {
-		var ext release.Fields
-		switch img.Type {
-		case discover.TypeRaw:
-			ext, err = c.rawExtensionRelease(img, arch)
-		default: // discover.TypeDirectory
-			ext, err = release.FindExtensionRelease(img.Path, img.Name, c.cfg.class)
-		}
-		if err != nil {
-			return false, fmt.Errorf("extension '%s': %w", img.Name, err)
-		}
-		if err := release.Match(host, ext, c.cfg.class, arch); err != nil {
-			return false, fmt.Errorf("extension '%s' is not compatible with the host: %w",
-				img.Name, err)
-		}
-		if wantsReload(ext) {
-			reloadRequested = true
-		}
-	}
-	return reloadRequested, nil
+// failure is an error worded like the systemd-sysext message it mirrors.
+type failure struct {
+	msg string
+	err error
 }
 
-// rawExtensionRelease mounts a raw image at a temporary mount point under
-// <root>/run, reads its extension-release file and unmounts again.
-//
-// TODO(MVP): this means raw images are mounted twice — once here for
-// validation and once inside overlay.Merge — because overlay.Merge takes
-// already-validated images and exposes no post-mount validation hook.
-// Acceptable cost for the MVP; revisit if overlay grows a hook.
-func (c *cli) rawExtensionRelease(img discover.Image, arch string) (release.Fields, error) {
-	runDir := filepath.Join(c.cfg.root, "/run")
-	mountPoint, err := os.MkdirTemp(runDir, ".sysext-validate-")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create validation mount point: %w", err)
-	}
-	defer os.RemoveAll(mountPoint)
+func (f *failure) Error() string { return f.msg }
+func (f *failure) Unwrap() error { return f.err }
 
-	m, err := image.MountWithOpts(img, mountPoint,
-		image.MountOpts{Arch: arch, Policy: c.cfg.imagePolicy, TrustDir: filepath.Join(c.cfg.root, "/etc/verity.d")})
-	if err != nil {
-		return nil, fmt.Errorf("failed to mount for validation: %w", err)
+// failMsg builds a failure with a fixed message.
+func failMsg(format string, args ...any) error {
+	return &failure{msg: fmt.Sprintf(format, args...)}
+}
+
+// failf builds a failure "MESSAGE: STRERROR", like systemd's %m.
+func failf(err error, format string, args ...any) error {
+	return &failure{msg: fmt.Sprintf(format, args...) + ": " + strerror(err), err: err}
+}
+
+// errnoSentinels are the io/fs errors Go reports some errnos as.
+var errnoSentinels = []struct {
+	err   error
+	errno unix.Errno
+}{
+	{fs.ErrNotExist, unix.ENOENT},
+	{fs.ErrExist, unix.EEXIST},
+	{fs.ErrPermission, unix.EACCES},
+	{fs.ErrInvalid, unix.EINVAL},
+	{fs.ErrClosed, unix.EBADF},
+}
+
+// errnoOf returns the errno behind err and how Go words it in err's message:
+// the first unix.Errno in the chain, else the io/fs error err matches; 0 and
+// "" when err carries no errno.
+func errnoOf(err error) (unix.Errno, string) {
+	if e, ok := errors.AsType[unix.Errno](err); ok {
+		return e, e.Error()
 	}
-	defer func() {
-		if err := m.Unmount(); err != nil {
-			fmt.Fprintf(c.stderr, "Warning: failed to unmount '%s': %v\n", mountPoint, err)
+	for _, s := range errnoSentinels {
+		if errors.Is(err, s.err) {
+			return s.errno, s.err.Error()
 		}
-	}()
-	return release.FindExtensionRelease(m.Root, img.Name, c.cfg.class)
+	}
+	return 0, ""
+}
+
+// strerror renders the errno behind err like the C library's strerror(),
+// systemd's %m. An error without one is reported as EINVAL: the Go wording
+// of an error never ends up in a message systemd words with an errno.
+func strerror(err error) string {
+	e, _ := errnoOf(err)
+	if e == 0 {
+		e = unix.EINVAL
+	}
+	return capitalize(e.Error())
 }

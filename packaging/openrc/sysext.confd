@@ -1,0 +1,10 @@
+# Options for /etc/init.d/sysext, passed to sysext refresh and unmerge.
+#
+# Examples:
+#   SYSEXT_OPTS="--mutable=ephemeral"         writable /usr, changes are lost
+#                                             on unmerge
+#   SYSEXT_OPTS="--image-policy=root=signed"  only merge signed disk images
+#   SYSEXT_OPTS="--no-reload"                 do not refresh OpenRC's
+#                                             dependency cache or restart the
+#                                             services extensions ask for
+#SYSEXT_OPTS=""

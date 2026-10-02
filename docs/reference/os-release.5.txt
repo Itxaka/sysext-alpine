@@ -201,20 +201,25 @@ OPTIONS
          Examples: "VERSION=17", "VERSION="17 (Beefy Miracle)"".
 
      VERSION_ID=
-         A  lower-case  string  (mostly  numeric, no spaces or other characters
-         outside of 0–9, a–z, ".", "_" and "-") identifying the operating  sys‐
-         tem  version,  excluding any OS name information or release code name,
-         and suitable for processing by scripts or  usage  in  generated  file‐
-         names. This field is optional.
+         A  string  (lower-case recommended, no spaces or other characters out‐
+         side of 0–9, a–z, A-Z, ".", "-", "~", "^", "+"  and  "_")  identifying
+         the operating system version, excluding any OS name information or re‐
+         lease  code  name,  and suitable for processing by scripts or usage in
+         generated filenames. This field is optional.
+
+         It   is   recommended   to   follow   the   UAPI.10   Version   Format
+         Specification[5]  for  this  version string, but this is generally not
+         enforced.
 
          Examples: "VERSION_ID=17", "VERSION_ID=11.04".
 
      VERSION_CODENAME=
-         A  lower-case  string  (no  spaces or other characters outside of 0–9,
-         a–z, ".", "_" and "-") identifying the operating system  release  code
-         name,  excluding any OS name information or release version, and suit‐
-         able for processing by scripts or usage in generated  filenames.  This
-         field is optional and may not be implemented on all systems.
+         A string (lower-case recommended, no spaces or other  characters  out‐
+         side  of  0–9, a–z, A-Z, ".", "-", "~", "^", "+", and "_") identifying
+         the operating system release code name, excluding any OS name informa‐
+         tion or release version, and suitable for processing by scripts or us‐
+         age in generated filenames. This field is optional and may not be  im‐
+         plemented on all systems.
 
          Examples: "VERSION_CODENAME=buster", "VERSION_CODENAME=xenial".
 
@@ -247,40 +252,45 @@ OPTIONS
          Added in version 249.
 
      IMAGE_VERSION=
-         A  lower-case  string  (mostly  numeric, no spaces or other characters
-         outside of 0–9, a–z, ".", "_" and "-") identifying the OS  image  ver‐
-         sion.  This  is  supposed  to be used together with IMAGE_ID described
-         above, to discern different versions of the same image.
+         A  string  (lower-case recommended, no spaces or other characters out‐
+         side of 0–9, a–z, A-Z, ".", "-", "~", "^", "+"  and  "_")  identifying
+         the  OS  image  version. This is supposed to be used together with IM‐
+         AGE_ID described above, to discern different versions of the same  im‐
+         age.
+
+         It   is   recommended   to   follow   the   UAPI.10   Version   Format
+         Specification[5] for this version string, but this  is  generally  not
+         enforced.
 
          Examples: "IMAGE_VERSION=33", "IMAGE_VERSION=47.1rc1".
 
          Added in version 249.
 
      RELEASE_TYPE=
-         A lower-case string (no spaces or other  characters  outside  of  0-9,
-         a-z,  ".", "_", and "-"), describing what kind of release this version
+         A  lower-case  string  (no  spaces or other characters outside of 0-9,
+         a-z, ".", "_", and "-"), describing what kind of release this  version
          of the OS is. Known values follow:
 
-         •   "stable" is for normal releases of the system, suitable  for  pro‐
-             duction  use.  Generally,  stable releases become end-of-life soon
-             after the next major stable release is out,  although  this  might
-             not  be  the case if, for example, a distribution adopts a rolling
-             release model and still be production ready. Examples include  Fe‐
+         •   "stable"  is  for normal releases of the system, suitable for pro‐
+             duction use. Generally, stable releases  become  end-of-life  soon
+             after  the  next  major stable release is out, although this might
+             not be the case if, for example, a distribution adopts  a  rolling
+             release  model and still be production ready. Examples include Fe‐
              dora 40, Ubuntu 23.10, OpenSUSE Tumbleweed, and Arch Linux.
 
-         •   "lts"  is  for  long term support releases of the system, suitable
-             for production use and supported for an extended period  of  time.
-             Generally,  LTS releases continue to receive support even if newer
+         •   "lts" is for long term support releases of  the  system,  suitable
+             for  production  use and supported for an extended period of time.
+             Generally, LTS releases continue to receive support even if  newer
              major releases of the distribution are available. Examples include
              Ubuntu 24.04, Debian 12 Bookworm, and RHEL 9.4.
 
-         •   "development" is for unstable versions of the  system,  unsuitable
-             for  production  use, such as alpha, beta, or rolling unstable re‐
+         •   "development"  is  for unstable versions of the system, unsuitable
+             for production use, such as alpha, beta, or rolling  unstable  re‐
              leases. Examples include Fedora Rawhide, Debian Testing, Fedora 40
              Beta, and GNOME OS Nightly.
 
-         •   "experiment" is for experimental builds  of  the  system,  created
-             specifically  to test some work-in-progress feature. This is meant
+         •   "experiment"  is  for  experimental  builds of the system, created
+             specifically to test some work-in-progress feature. This is  meant
              to be used in combination with EXPERIMENT=.
 
          If unset, or an unknown value, assume that the release is "stable".
@@ -289,57 +299,57 @@ OPTIONS
 
          Added in version 257.
 
-     To summarize: if the image updates are built and shipped as  comprehensive
+     To  summarize: if the image updates are built and shipped as comprehensive
      units, IMAGE_ID+IMAGE_VERSION is the best fit. Otherwise, if updates even‐
-     tually  completely  replace previously installed contents, as in a typical
-     binary distribution, VERSION_ID should be used to identify major  releases
-     of  the  operating system.  BUILD_ID may be used instead or in addition to
+     tually completely replace previously installed contents, as in  a  typical
+     binary  distribution, VERSION_ID should be used to identify major releases
+     of the operating system.  BUILD_ID may be used instead or in  addition  to
      VERSION_ID when the original system image version is important.
 
    Presentation information and links
      HOME_URL=, DOCUMENTATION_URL=, SUPPORT_URL=, BUG_REPORT_URL=, PRIVACY_POL‐
      ICY_URL=
-         Links to resources on the Internet related to  the  operating  system.
+         Links  to  resources  on the Internet related to the operating system.
          HOME_URL= should refer to the homepage of the operating system, or al‐
-         ternatively  some  homepage  of  the specific version of the operating
-         system.  DOCUMENTATION_URL= should refer  to  the  main  documentation
+         ternatively some homepage of the specific  version  of  the  operating
+         system.   DOCUMENTATION_URL=  should  refer  to the main documentation
          page for this operating system.  SUPPORT_URL= should refer to the main
-         support  page  for the operating system, if there is any. This is pri‐
-         marily intended for operating systems which  vendors  provide  support
-         for.   BUG_REPORT_URL= should refer to the main bug reporting page for
-         the operating system, if there is any. This is primarily intended  for
-         operating  systems  that  rely  on  community QA.  PRIVACY_POLICY_URL=
+         support page for the operating system, if there is any. This  is  pri‐
+         marily  intended  for  operating systems which vendors provide support
+         for.  BUG_REPORT_URL= should refer to the main bug reporting page  for
+         the  operating system, if there is any. This is primarily intended for
+         operating systems that  rely  on  community  QA.   PRIVACY_POLICY_URL=
          should refer to the main privacy policy page for the operating system,
-         if there is any. These settings are optional, and providing only  some
-         of  these settings is common. These URLs are intended to be exposed in
+         if  there is any. These settings are optional, and providing only some
+         of these settings is common. These URLs are intended to be exposed  in
          "About this system" UIs behind links with captions such as "About this
-         Operating System", "Obtain Support", "Report a Bug", or "Privacy  Pol‐
-         icy". The values should be in RFC3986 format[5], and should be "http:"
+         Operating  System", "Obtain Support", "Report a Bug", or "Privacy Pol‐
+         icy". The values should be in RFC3986 format[6], and should be "http:"
          or "https:" URLs, and possibly "mailto:" or "tel:". Only one URL shall
-         be  listed  in  each  setting. If multiple resources need to be refer‐
+         be listed in each setting. If multiple resources  need  to  be  refer‐
          enced, it is recommended to provide an online landing page linking all
          available resources.
 
-         Examples:      "HOME_URL="https://fedoraproject.org/"",       "BUG_RE‐
+         Examples:       "HOME_URL="https://fedoraproject.org/"",      "BUG_RE‐
          PORT_URL="https://bugzilla.redhat.com/"".
 
      SUPPORT_END=
-         The  date  at which support for this version of the OS ends. (What ex‐
-         actly "lack of support" means varies between  vendors,  but  generally
-         users  should  assume that updates, including security fixes, will not
+         The date at which support for this version of the OS ends.  (What  ex‐
+         actly  "lack  of  support" means varies between vendors, but generally
+         users should assume that updates, including security fixes,  will  not
          be provided.) The value is a date in the ISO 8601 format "YYYY-MM-DD",
          and specifies the first day on which support is not provided.
 
-         For example, "SUPPORT_END=2001-01-01" means that the system  was  sup‐
+         For  example,  "SUPPORT_END=2001-01-01" means that the system was sup‐
          ported until the end of the last day of the previous millennium.
 
          Added in version 252.
 
      LOGO=
          A string, specifying the name of an icon as defined by freedesktop.org
-         Icon  Theme  Specification[6].  This can be used by graphical applica‐
-         tions to display an operating system's  or  distributor's  logo.  This
-         field  is  optional and may not necessarily be implemented on all sys‐
+         Icon Theme Specification[7]. This can be used  by  graphical  applica‐
+         tions  to  display  an  operating system's or distributor's logo. This
+         field is optional and may not necessarily be implemented on  all  sys‐
          tems.
 
          Examples: "LOGO=fedora-logo", "LOGO=distributor-logo-opensuse"
@@ -347,28 +357,28 @@ OPTIONS
          Added in version 240.
 
      ANSI_COLOR=
-         A suggested presentation (foreground) text color when showing  the  OS
-         name  on  the console. This should be specified as string suitable for
-         inclusion in the ESC [ m ANSI/ECMA-48 escape code for setting  graphi‐
+         A  suggested  presentation (foreground) text color when showing the OS
+         name on the console. This should be specified as string  suitable  for
+         inclusion  in the ESC [ m ANSI/ECMA-48 escape code for setting graphi‐
          cal rendition. This field is optional.
 
-         Examples:  "ANSI_COLOR="0;31""  for red, "ANSI_COLOR="1;34"" for light
+         Examples: "ANSI_COLOR="0;31"" for red, "ANSI_COLOR="1;34""  for  light
          blue, or "ANSI_COLOR="0;38;2;60;110;180"" for Fedora blue.
 
      ANSI_COLOR_REVERSE=
-         Similar to ANSI_COLOR=, but should  encode  the  desired  presentation
-         color  as  background  color,  along with a suitable foreground color.
+         Similar  to  ANSI_COLOR=,  but  should encode the desired presentation
+         color as background color, along with  a  suitable  foreground  color.
          This is may be used by console applications to set off "chrome" UI el‐
          ements from the main terminal contents. This field is optional.
 
          Added in version 259.
 
      VENDOR_NAME=
-         The name of the OS vendor. This is the name  of  the  organization  or
+         The  name  of  the  OS vendor. This is the name of the organization or
          company which produces the OS. This field is optional.
 
-         This  name  is  intended  to  be exposed in "About this system" UIs or
-         software update UIs when needed to distinguish the OS vendor from  the
+         This name is intended to be exposed in  "About  this  system"  UIs  or
+         software  update UIs when needed to distinguish the OS vendor from the
          OS itself. It is intended to be human-readable.
 
          Examples:  "VENDOR_NAME="Fedora  Project""  for  Fedora  Linux,  "VEN‐
@@ -377,11 +387,11 @@ OPTIONS
          Added in version 254.
 
      VENDOR_URL=
-         The homepage of the OS  vendor.  This  field  is  optional.  The  VEN‐
+         The  homepage  of  the  OS  vendor.  This  field is optional. The VEN‐
          DOR_NAME= field should be set if this one is, although clients must be
          robust against either field not being set.
 
-         The  value  should  be  in RFC3986 format[5], and should be "http:" or
+         The value should be in RFC3986 format[6], and  should  be  "http:"  or
          "https:" URLs. Only one URL shall be listed in the setting.
 
          Examples:       "VENDOR_URL="https://fedoraproject.org/"",       "VEN‐
@@ -391,33 +401,33 @@ OPTIONS
 
      EXPERIMENT=
          A human-presentable description of what makes this build of the OS ex‐
-         perimental.  This  field is optional. The RELEASE_TYPE field should be
+         perimental. This field is optional. The RELEASE_TYPE field  should  be
          set to "experiment" if this field is set, otherwise clients should ig‐
          nore this field.
 
-         This description is intended to  be  exposed  at  system  installation
+         This  description  is  intended  to  be exposed at system installation
          time, or in "About this system" UIs, to warn the user that they're in‐
-         stalling/running  an  experimental build of the OS. If RELEASE_TYPE is
-         "experiment" but this field is unset, the UI  should  still  warn  the
-         user,  but  it  will be unable to explain what exactly is experimental
+         stalling/running an experimental build of the OS. If  RELEASE_TYPE  is
+         "experiment"  but  this  field  is unset, the UI should still warn the
+         user, but it will be unable to explain what  exactly  is  experimental
          about the current build of the OS.
 
-         Examples: "EXPERIMENT="Switch to DNF5"" for an experimental  build  of
-         Fedora  Linux  made to test DNF5, "EXPERIMENT="Port to Apple M3 chip""
-         for experimental builds of Asahi Linux ported to  the  Apple  M3  SoC,
-         "EXPERIMENT="Mutter  !1441: Dynamic triple/double buffering (v4)"" for
+         Examples:  "EXPERIMENT="Switch  to DNF5"" for an experimental build of
+         Fedora Linux made to test DNF5, "EXPERIMENT="Port to Apple  M3  chip""
+         for  experimental  builds  of  Asahi Linux ported to the Apple M3 SoC,
+         "EXPERIMENT="Mutter !1441: Dynamic triple/double buffering (v4)""  for
          builds of GNOME OS created by Mutter's CI for merge request !1441.
 
          Added in version 257.
 
      EXPERIMENT_URL=
-         The main informational page about what makes the current OS build  ex‐
-         perimental,  where  users can learn more about the experiment's status
-         and potentially leave feedback. This field is  optional.  The  EXPERI‐
+         The  main informational page about what makes the current OS build ex‐
+         perimental, where users can learn more about the  experiment's  status
+         and  potentially  leave  feedback. This field is optional. The EXPERI‐
          MENT= field should be set if this one is, although clients must be ro‐
          bust against either field not being set.
 
-         The  value  should  be  in RFC3986 format[5], and should be "http:" or
+         The value should be in RFC3986 format[6], and  should  be  "http:"  or
          "https:" URLs. Only one URL shall be listed in the setting.
 
          Examples, corresponding to the examples above in EXPERIMENT=: "EXPERI‐
@@ -430,41 +440,41 @@ OPTIONS
 
    Distribution-level defaults and metadata
      DEFAULT_HOSTNAME=
-         A string specifying the hostname if hostname(5) is not present and  no
-         other  configuration  source  specifies the hostname. Must be either a
-         single DNS label (a string composed of 7-bit ASCII lower-case  charac‐
-         ters  and no spaces or dots, limited to the format allowed for DNS do‐
-         main name labels), or a sequence of such labels  separated  by  single
-         dots  that  forms  a  valid  DNS FQDN. The hostname must be at most 64
+         A  string specifying the hostname if hostname(5) is not present and no
+         other configuration source specifies the hostname. Must  be  either  a
+         single  DNS label (a string composed of 7-bit ASCII lower-case charac‐
+         ters and no spaces or dots, limited to the format allowed for DNS  do‐
+         main  name  labels),  or a sequence of such labels separated by single
+         dots that forms a valid DNS FQDN. The hostname  must  be  at  most  64
          characters, which is a Linux limitation (DNS allows longer names).
 
-         If the question mark character "?" appears in the hostname, it is  au‐
-         tomatically  substituted  by  a hexadecimal character derived from the
-         machine-id(5) when applied, securely and deterministically by  crypto‐
+         If  the question mark character "?" appears in the hostname, it is au‐
+         tomatically substituted by a hexadecimal character  derived  from  the
+         machine-id(5)  when applied, securely and deterministically by crypto‐
          graphic hashing. Example: "foobar-????-????" will automatically expand
          to "foobar-92a9-061c" or similar, depending on the local machine ID.
 
-         See  org.freedesktop.hostname1(5)  for  a  description of how systemd-
+         See org.freedesktop.hostname1(5) for a  description  of  how  systemd-
          hostnamed.service(8) determines the fallback hostname.
 
          Added in version 248.
 
      ARCHITECTURE=
-         A string that specifies which CPU architecture the userspace  binaries
+         A  string that specifies which CPU architecture the userspace binaries
          require. The architecture identifiers are the same as for ConditionAr‐
-         chitecture=  described  in  systemd.unit(5). The field is optional and
+         chitecture= described in systemd.unit(5). The field  is  optional  and
          should only be used when just single architecture is supported. It may
          provide redundant information when used in a GPT partition with a GUID
-         type that already encodes the architecture. If this is not  the  case,
-         the  architecture  should be specified in e.g., an extension image, to
+         type  that  already encodes the architecture. If this is not the case,
+         the architecture should be specified in e.g., an extension  image,  to
          prevent an incompatible host from loading it.
 
          Added in version 252.
 
      SYSEXT_LEVEL=
-         A lower-case string (mostly numeric, no  spaces  or  other  characters
-         outside  of 0–9, a–z, ".", "_" and "-") identifying the operating sys‐
-         tem extensions support level, to indicate which extension  images  are
+         A  lower-case  string  (mostly  numeric, no spaces or other characters
+         outside of 0–9, a–z, ".", "_" and "-") identifying the operating  sys‐
+         tem  extensions  support level, to indicate which extension images are
          supported.  See  /usr/lib/extension-release.d/extension-release.IMAGE,
          initrd[2] and systemd-sysext(8)) for more information.
 
@@ -473,7 +483,7 @@ OPTIONS
          Added in version 248.
 
      CONFEXT_LEVEL=
-         Semantically the same as SYSEXT_LEVEL= but  for  confext  images.  See
+         Semantically  the  same  as  SYSEXT_LEVEL= but for confext images. See
          /etc/extension-release.d/extension-release.IMAGE for more information.
 
          Examples: "CONFEXT_LEVEL=2", "CONFEXT_LEVEL=15.14".
@@ -481,13 +491,13 @@ OPTIONS
          Added in version 254.
 
      SYSEXT_SCOPE=
-         Takes  a  space-separated list of one or more of the strings "system",
+         Takes a space-separated list of one or more of the  strings  "system",
          "initrd" and "portable". This field is only supported in extension-re‐
          lease.d/ files and indicates what environments the system extension is
-         applicable to: i.e. to regular systems, to initrds and exitrds, or  to
-         portable   service  images.  If  not  specified,  "SYSEXT_SCOPE=system
-         portable" is implied, i.e. any system extension without this field  is
-         applicable  to  regular  systems and to portable service environments,
+         applicable  to: i.e. to regular systems, to initrds and exitrds, or to
+         portable  service  images.  If  not  specified,   "SYSEXT_SCOPE=system
+         portable"  is implied, i.e. any system extension without this field is
+         applicable to regular systems and to  portable  service  environments,
          but not to initrd/exitrd environments.
 
          Added in version 250.
@@ -500,47 +510,47 @@ OPTIONS
      PORTABLE_PREFIXES=
          Takes a space-separated list of one or more valid prefix match strings
          for the Portable Services[3] logic. This field serves two purposes: it
-         is informational, identifying portable service  images  as  such  (and
-         thus  allowing  them to be distinguished from other OS images, such as
+         is  informational,  identifying  portable  service images as such (and
+         thus allowing them to be distinguished from other OS images,  such  as
          bootable system images). It is also used when a portable service image
-         is attached: the specified  or  implied  portable  service  prefix  is
-         checked  against  the list specified here, to enforce restrictions how
+         is  attached:  the  specified  or  implied  portable service prefix is
+         checked against the list specified here, to enforce  restrictions  how
          images may be attached to a system.
 
          Added in version 250.
 
      PORTABLE_SCOPE=
-         Specifies the scope of the portable service. Takes  one  of  "system",
-         "user",  or "any". When set to "system", the portable service can only
-         be attached to the system instance of systemd-portabled. When  set  to
+         Specifies  the  scope  of the portable service. Takes one of "system",
+         "user", or "any". When set to "system", the portable service can  only
+         be  attached  to the system instance of systemd-portabled. When set to
          "user", the portable service can only be attached to the user instance
-         of  systemd-portabled.  When set to "any", the portable service can be
-         attached to both the system and user instances  of  systemd-portabled.
+         of systemd-portabled. When set to "any", the portable service  can  be
+         attached  to  both the system and user instances of systemd-portabled.
          If not set, "PORTABLE_SCOPE=system" is implied.
 
          Added in version 259.
 
    Notes
-     If  you  are  using this file to determine the OS or a specific version of
-     it, use the ID and VERSION_ID fields, possibly with  ID_LIKE  as  fallback
-     for  ID.  When looking for an OS identification string for presentation to
+     If you are using this file to determine the OS or a  specific  version  of
+     it,  use  the  ID and VERSION_ID fields, possibly with ID_LIKE as fallback
+     for ID. When looking for an OS identification string for  presentation  to
      the user use the PRETTY_NAME field.
 
-     Note that operating system vendors may choose not to provide  version  in‐
-     formation,  for example to accommodate for rolling releases. In this case,
+     Note  that  operating system vendors may choose not to provide version in‐
+     formation, for example to accommodate for rolling releases. In this  case,
      VERSION and VERSION_ID may be unset. Applications should not rely on these
      fields to be set.
 
-     Operating system vendors may extend the  file  format  and  introduce  new
-     fields.  It is highly recommended to prefix new fields with an OS-specific
-     name in order to avoid name clashes. Applications reading this  file  must
+     Operating  system  vendors  may  extend  the file format and introduce new
+     fields. It is highly recommended to prefix new fields with an  OS-specific
+     name  in  order to avoid name clashes. Applications reading this file must
      ignore unknown fields.
 
      Example: "DEBIAN_BTS="debbugs://bugs.debian.org/"".
 
-     Container  and sandbox runtime managers may make the host's identification
+     Container and sandbox runtime managers may make the host's  identification
      data available to applications by providing the host's /etc/os-release (if
-     available,   otherwise   /usr/lib/os-release    as    a    fallback)    as
+     available,    otherwise    /usr/lib/os-release    as    a   fallback)   as
      /run/host/os-release.
 
 EXAMPLES
@@ -566,7 +576,7 @@ EXAMPLES
          VARIANT="Workstation Edition"
          VARIANT_ID=workstation
 
-     Example 2. extension-release  file for an extension for Fedora Workstation
+     Example 2. extension-release file for an extension for Fedora  Workstation
      32
 
          ID=fedora
@@ -592,16 +602,16 @@ EXAMPLES
          # SPDX-License-Identifier: MIT-0
 
          import platform
+
          os_release = platform.freedesktop_os_release()
 
          pretty_name = os_release.get('PRETTY_NAME', 'Linux')
          print(f'Running on {pretty_name!r}')
 
-         if 'fedora' in [os_release.get('ID', 'linux'),
-                         *os_release.get('ID_LIKE', '').split()]:
+         if 'fedora' in [os_release.get('ID', 'linux'), *os_release.get('ID_LIKE', '').split()]:
              print('Looks like Fedora!')
 
-     See docs for platform.freedesktop_os_release[7] for more details.
+     See docs for platform.freedesktop_os_release[8] for more details.
 
      Example 5. Reading os-release in python(1) (any version)
 
@@ -630,19 +640,17 @@ EXAMPLES
                          val = ast.literal_eval(val)
                      yield name, val
                  else:
-                     print(f'{filename}:{line_number}: bad line {line!r}',
-                           file=sys.stderr)
+                     print(f'{filename}:{line_number}: bad line {line!r}', file=sys.stderr)
 
          os_release = dict(read_os_release())
 
          pretty_name = os_release.get('PRETTY_NAME', 'Linux')
          print(f'Running on {pretty_name!r}')
 
-         if 'debian' in [os_release.get('ID', 'linux'),
-                         *os_release.get('ID_LIKE', '').split()]:
+         if 'debian' in [os_release.get('ID', 'linux'), *os_release.get('ID_LIKE', '').split()]:
              print('Looks like Debian!')
 
-     Note that the above version that uses the built-in implementation is  pre‐
+     Note  that the above version that uses the built-in implementation is pre‐
      ferred in most cases, and the open-coded version here is provided for ref‐
      erence.
 
@@ -662,13 +670,16 @@ NOTES
       4. Common Platform Enumeration Specification
          http://scap.nist.gov/specifications/cpe/
 
-      5. RFC3986 format
+      5. UAPI.10 Version Format Specification
+         https://uapi-group.org/specifications/specs/version_format_specification/
+
+      6. RFC3986 format
          https://tools.ietf.org/html/rfc3986
 
-      6. freedesktop.org Icon Theme Specification
+      7. freedesktop.org Icon Theme Specification
          https://standards.freedesktop.org/icon-theme-spec/latest
 
-      7. platform.freedesktop_os_release
+      8. platform.freedesktop_os_release
          https://docs.python.org/3/library/platform.html#platform.freedesktop_os_release
 
-systemd 260.2                                                     OS-RELEASE(5)
+systemd 262                                                       OS-RELEASE(5)

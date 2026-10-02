@@ -5,34 +5,62 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  lint-test:
+  lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: gofmt
-        run: test -z "$(gofmt -l .)"
-      - name: go vet
-        run: go vet ./...
-      - name: go test (with coverage)
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+      - name: go fix (modernizers)
+        run: test -z "$(go fix -diff ./...)"
+      - name: govulncheck
+        run: make vuln
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: go test (race, coverage)
         run: |
-          go test -coverprofile=coverage.out -covermode=atomic ./...
+          CGO_ENABLED=1 go test -race -coverprofile=coverage.out -covermode=atomic ./...
           {
             echo '## Unit coverage'
             echo '```'
             go tool cover -func=coverage.out | tail -n 1
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - name: go test (386)
+        run: CGO_ENABLED=0 GOARCH=386 go test ./...
+      - name: go vet (other architectures)
+        run: |
+          for arch in arm arm64 ppc64le riscv64 s390x loong64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go vet ./... || exit 1
+          done
+      - name: fuzz smoke
+        run: make fuzz FUZZTIME=15s
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-unit
           path: coverage.out
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: coverage.out
           flags: unit
@@ -42,70 +70,152 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      matrix:
-        goarch: [amd64, arm64, riscv64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Cross-compile (linux/${{ matrix.goarch }})
-        env:
-          CGO_ENABLED: '0'
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
-          go build -trimpath \
-            -ldflags "-s -w -X main.version=${VERSION} -extldflags \"-static\"" \
-            -o bin/sysext-linux-${{ matrix.goarch }} ./cmd/sysext
-      - uses: actions/upload-artifact@v4
+      - name: Cross-compile
+        run: make build-all
+      - uses: actions/upload-artifact@v7
         with:
-          name: sysext-linux-${{ matrix.goarch }}
-          path: bin/sysext-linux-${{ matrix.goarch }}
+          name: sysext-linux
+          path: bin/sysext-linux-*
           if-no-files-found: error
 
-  e2e:
+  # Root-only integration tests (mounts, mknod): plain `go test` skips them.
+  integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      # Build the signed example DDI so the interop part of inner-signed.sh
-      # runs (it SKIPs gracefully when systemd-repart is unavailable).
-      - name: Build signed example
+      - name: go test as root in a private mount namespace
+        shell: bash
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q erofs-utils systemd-repart || \
-            sudo apt-get install -y -q erofs-utils || true
-          if command -v systemd-repart >/dev/null; then
-            make example
-          else
-            echo "systemd-repart unavailable; interop fixture test will SKIP"
+          for pkg in overlay discover; do
+            go test -c -o "$RUNNER_TEMP/$pkg.test" "./internal/$pkg/"
+            sudo unshare -m --propagation private "$RUNNER_TEMP/$pkg.test" -test.count=1 -test.v | tee "$RUNNER_TEMP/$pkg.log"
+          done
+          if grep -- '--- SKIP' "$RUNNER_TEMP"/*.log; then
+            echo "::error::root-only tests skipped"
+            exit 1
           fi
-      # Privileged Alpine container with /lib/modules mounted; suites that
-      # need a kernel module unavailable on the runner (e.g. erofs) SKIP.
-      # Runs with a coverage-instrumented binary (make e2e-cover) so the
-      # mount/loop/dm paths unit tests cannot reach are measured too.
+
+  e2e:
+    name: e2e (${{ matrix.image }}, ${{ matrix.propagation }}, ${{ matrix.build }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['alpine:3.24', 'alpine:edge']
+        propagation: [private, shared]
+        build: [cover]
+        include:
+          # The stripped release binary, as shipped.
+          - image: 'alpine:3.24'
+            propagation: shared
+            build: release
+    env:
+      IMAGE: ${{ matrix.image }}
+      E2E_PROPAGATION: ${{ matrix.propagation }}
+      E2E_STRICT: '1'
+      E2E_EXCLUDE: differential
+      E2E_LOGDIR: e2e-logs
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # run.sh builds the systemd-repart fixtures (signed DDIs) in
+      # archlinux:latest before the suites.
       - name: Run e2e suites (instrumented)
+        if: matrix.build == 'cover'
         run: make e2e-cover
+      - name: Run e2e suites (release binary)
+        if: matrix.build == 'release'
+        run: make e2e
       - name: e2e coverage summary
+        if: ${{ !cancelled() && matrix.build == 'cover' }}
         run: |
           {
-            echo '## e2e coverage'
+            echo "## e2e coverage (${IMAGE}, ${E2E_PROPAGATION})"
             echo '```'
             go tool cover -func=coverage-e2e.out | tail -n 1
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && matrix.build == 'cover' }}
         with:
-          name: coverage-e2e
-          path: coverage-e2e.out
+          name: covdata-e2e-${{ strategy.job-index }}
+          path: .covdata
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: e2e-logs-${{ strategy.job-index }}
+          path: e2e-logs
+
+  # Differential suite against the real systemd-sysext 262 of
+  # archlinux:latest (test/e2e/inner-differential.sh).
+  e2e-differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      E2E_STRICT: '1'
+      E2E_ARTIFACTS: e2e-artifacts
+      E2E_LOGDIR: e2e-logs
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Run the differential suite (instrumented)
+        run: make e2e-cover SUITES=differential
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: covdata-differential
+          path: .covdata
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: differential-transcripts
+          path: |
+            e2e-artifacts
+            e2e-logs
+
+  coverage:
+    needs: [e2e, e2e-differential]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: covdata-*
+          path: .covdata
+          merge-multiple: true
+      - name: Merge e2e coverage
+        run: |
+          go tool covdata textfmt -i=.covdata -o=coverage-e2e.out
+          {
+            echo '## e2e coverage (all suites, images and propagation modes)'
+            echo '```'
+            go tool covdata percent -i=.covdata
+            go tool cover -func=coverage-e2e.out | tail -n 1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: coverage-e2e.out
           flags: e2e
